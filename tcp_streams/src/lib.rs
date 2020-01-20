@@ -5,7 +5,7 @@ use bytes::buf::BufMut;
 use bytes::{Buf, BytesMut};
 use futures::prelude::*;
 use futures::stream::SelectAll;
-use tokio::io::ReadHalf;
+use tokio::net::tcp::ReadHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
@@ -29,38 +29,51 @@ pub enum Shutdown {
     Normal,
 }
 
-pub struct TcpStreams {
+type Readers<'a> = SelectAll<FramedRead<ReadHalf<'a>, PacketReader>>;
+
+pub struct TcpStreams<'a> {
     metrics_sender: EventSender,
-    readers: SelectAll<FramedRead<ReadHalf<TcpStream>, PacketReader>>,
+    readers: Readers<'a>,
+    listener: Option<TcpListener>,
 }
-impl std::fmt::Debug for TcpStreams {
+impl<'a> std::fmt::Debug for TcpStreams<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpStreams").finish()
     }
 }
 
-impl TcpStreams {
+impl<'a> TcpStreams<'a> {
     pub fn new(metrics_sender: EventSender) -> Self {
         let readers = SelectAll::new();
         Self {
             metrics_sender,
             readers,
+            listener: None,
         }
     }
 }
 
-impl TcpStreams {
-    pub async fn start(
-        &mut self,
-        shutdown: oneshot::Receiver<()>,
-    ) -> Result<Shutdown, std::io::Error> {
+impl<'a> TcpStreams<'a> {
+    pub async fn bind(&mut self) -> Result<std::net::SocketAddr, std::io::Error> {
         tracing::info!("Starting");
 
         let addrs = listen_address();
         tracing::info!("Binding to {:?}", &addrs);
-        let mut listener = TcpListener::bind(&addrs).await?;
+        let listener = TcpListener::bind(&addrs).await?;
+        let local_addr = listener.local_addr();
+        self.listener = Some(listener);
+        local_addr
+    }
 
+    pub async fn start(
+        mut self,
+        shutdown: oneshot::Receiver<()>,
+    ) -> Result<Shutdown, std::io::Error> {
         let mut shutdown = shutdown.fuse();
+        let mut listener = self
+            .listener
+            .take()
+            .expect("Should have successfully bound to a socket.");
 
         tracing::info!("Waiting for connections");
         loop {
@@ -70,7 +83,7 @@ impl TcpStreams {
             futures::select! {
                 _ = shutdown => {
                     tracing::warn!("shutting down!");
-                    return Ok(Shutdown::Normal);
+                    return Ok::<_, std::io::Error>(Shutdown::Normal);
                 }
                 incoming_res = incoming_fut.next().fuse() => {
                     self.handle_incoming(incoming_res);
@@ -83,9 +96,9 @@ impl TcpStreams {
         match incoming_res {
             Some(Ok(mut stream)) => {
                 tracing::trace!("new stream! {:?}", &stream);
-                let (rx, tx) = tokio::io::split(stream);
+                let (rx, tx) = stream.split();
                 let framed_read = FramedRead::new(rx, PacketReader {});
-                let framed_write = FramedWrite::new(tx, PacketWriter {});
+                let _framed_write = FramedWrite::new(tx, PacketWriter {});
                 self.readers.push(framed_read);
             }
             Some(Err(error)) => {
@@ -158,10 +171,28 @@ mod tests {
         let (metrics_sender, _metrics_receiver) = metrics::channel(100);
 
         let mut tcp_streams = TcpStreams::new(metrics_sender);
-        let start_fut = tcp_streams.start(shutdown_rx);
+        let _socket_addr = tcp_streams.bind().await.unwrap();
+        let shutdown_status = tcp_streams.start(shutdown_rx).await.unwrap();
 
         let _ = shutdown_tx.send(());
-        let shutdown_status = start_fut.await.unwrap();
+        assert_eq!(Shutdown::Normal, shutdown_status);
+    }
+
+    #[tokio::test(basic_scheduler)]
+    async fn socket_shutdown() {
+        // Checking if we can shutdown a socket after splitting it.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (metrics_sender, _metrics_receiver) = metrics::channel(100);
+
+        let mut tcp_streams = TcpStreams::new(metrics_sender);
+        let socket_addr = tcp_streams.bind().await.unwrap();
+        let shutdown_status = tcp_streams.start(shutdown_rx).await.unwrap();
+
+        let mut stream = tokio::net::TcpStream::connect(socket_addr).await.unwrap();
+        let (_rx, _tx) = stream.split();
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+
+        let _ = shutdown_tx.send(());
         assert_eq!(Shutdown::Normal, shutdown_status);
     }
 }
