@@ -10,8 +10,8 @@ edition = "2018"
 metrics = { path = "../metrics" }
 
 futures = "0.3.1"
-tokio = { version = "0.2.9", features = ["full", "test-util"] }
+tokio = { version = "0.2.10", features = ["full", "test-util"] }
 tokio-util = { version = "0.2.0", features = ["codec"] }
 tracing = { version = "0.1.11", features = ["log"] }
-bytes = "0.5.3"
 byteorder = "1.3.2"
+bytes = "0.5.4"
