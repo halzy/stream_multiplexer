@@ -138,7 +138,7 @@ mod tests {
     use super::*;
 
     use tokio::io::AsyncReadExt as _;
-    use tokio::io::{AsyncRead, ErrorKind};
+    use tokio::io::ErrorKind;
 
     use futures::future::FutureExt;
 

@@ -1,15 +1,16 @@
 use byteorder::{BigEndian, ByteOrder};
 use bytes::buf::BufMut;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
+use futures::sink::SinkExt;
 use futures::stream::{SelectAll, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf};
+use tokio::io::{AsyncWriteExt as _, ReadHalf, WriteHalf};
 use tokio::stream::Stream;
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 use std::collections::HashMap;
 use std::io::Result as IoResult;
+use std::io::{Error, ErrorKind};
 
 mod stream_control;
 use stream_control::*;
@@ -51,7 +52,8 @@ impl<T, C> Sender<T, C> {
 }
 impl<T, C> Sender<T, C>
 where
-    T: AsyncWrite + Unpin + std::fmt::Debug,
+    T: tokio::io::AsyncWrite + Unpin + std::fmt::Debug,
+    C: Encoder<Item = BytesPacket, Error = std::io::Error>,
 {
     pub async fn shutdown(self) -> IoResult<()> {
         let mut write_half = self.sender.into_inner();
@@ -64,11 +66,15 @@ where
 
         result
     }
+
+    pub async fn send(&mut self, packet: BytesPacket) -> IoResult<()> {
+        self.sender.send(packet).await
+    }
 }
 
 pub struct PacketMultiplexer<T>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     readers: Readers<T>,
     prev_stream_id: StreamId,
@@ -76,18 +82,17 @@ where
 }
 impl<T> std::fmt::Debug for PacketMultiplexer<T>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PacketMultiplexer ").finish()
     }
 }
-
-impl<T> PacketMultiplexer<T>
+impl<T> Default for PacketMultiplexer<T>
 where
-    T: StreamShutdown + AsyncRead + AsyncWrite + Unpin,
+    T: StreamShutdown + tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    pub fn new() -> Self {
+    fn default() -> Self {
         let readers = SelectAll::new();
         Self {
             readers,
@@ -99,18 +104,51 @@ where
 
 impl<T> PacketMultiplexer<T>
 where
-    T: StreamShutdown + AsyncRead + AsyncWrite,
+    T: StreamShutdown + tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    pub fn new() -> Self {
+        Default::default()
+    }
+}
+
+pub enum ControlMessage {
+    Shutdown,
+}
+
+impl<T> PacketMultiplexer<T>
+where
+    T: StreamShutdown + tokio::io::AsyncRead + tokio::io::AsyncWrite,
     T: Send + Unpin + std::fmt::Debug,
 {
-    pub async fn run<I>(&mut self, mut incoming: I) -> IoResult<()>
+    pub async fn run<I, U>(&mut self, incoming: I, control: U) -> IoResult<()>
     where
-        I: Stream<Item = IoResult<T>> + Send + Unpin,
+        I: Stream<Item = IoResult<T>>,
+        U: Stream<Item = ControlMessage>,
     {
         tracing::info!("Waiting for connections");
-        while let Some(stream) = incoming.next().await {
-            self.handle_incoming_connection(stream);
+
+        let incoming_fused = incoming.fuse();
+        let control_fused = control.fuse();
+
+        futures::pin_mut!(incoming_fused);
+        futures::pin_mut!(control_fused);
+
+        loop {
+            futures::select!(
+                control_message_opt = control_fused.next() => {
+                    if let Some(control_message) = control_message_opt {
+                        match control_message {
+                            ControlMessage::Shutdown => { return Ok(()); }
+                        }
+                    }
+                }
+                stream_opt = incoming_fused.next() => {
+                    if let Some(stream) = stream_opt {
+                        self.handle_incoming_connection(stream);
+                    }
+                }
+            )
         }
-        Ok(())
     }
 
     fn handle_incoming_connection(&mut self, incoming_res: Result<T, std::io::Error>) {
@@ -150,7 +188,6 @@ where
     }
 
     pub async fn close_stream(&mut self, stream_id: StreamId) -> IoResult<()> {
-        use std::io::{Error, ErrorKind};
         // is it in the map?
         match self.senders.remove(&stream_id) {
             // borrow the stream from the writer
@@ -164,12 +201,22 @@ where
             )),
         }
     }
+
+    pub async fn send(&mut self, packet: BytesPacket) -> IoResult<()> {
+        match self.senders.get_mut(&packet.stream_id) {
+            None => Err(Error::new(
+                ErrorKind::Other,
+                format!("Sending to non-existent stream: {}", packet.stream_id),
+            )),
+            Some(sender) => sender.send(packet).await,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
-struct BytesPacket {
-    stream_id: StreamId,
-    bytes: BytesMut,
+pub struct BytesPacket {
+    stream_id: Vec<StreamId>,
+    bytes: Bytes,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -196,7 +243,7 @@ impl Decoder for PacketReader {
 
         if src.len() >= (size + 2) {
             src.advance(2); // Remove Packet Size
-            let bytes = src.split_to(size);
+            let bytes = src.split_to(size).freeze();
 
             let packet = BytesPacket {
                 stream_id: self.stream_id,
@@ -229,6 +276,7 @@ impl Encoder for PacketWriter {
 mod tests {
     use super::*;
 
+    use futures::stream;
     use tokio::net::TcpListener;
 
     pub async fn bind() -> IoResult<TcpListener> {
@@ -241,28 +289,32 @@ mod tests {
     #[tokio::test(basic_scheduler)]
     async fn shutdown() {
         let mut socket = bind().await.unwrap();
-
+        let control_stream = stream::once(async { ControlMessage::Shutdown });
         let mut tcp_streams = PacketMultiplexer::new();
         let shutdown_status =
-            tokio::task::spawn(async move { tcp_streams.run(socket.incoming()).await });
+            tokio::task::spawn(
+                async move { tcp_streams.run(socket.incoming(), control_stream).await },
+            );
 
         assert!(shutdown_status.await.is_ok());
     }
 
-    /*
     #[tokio::test(basic_scheduler)]
     async fn socket_shutdown() {
-        let tcp_streams = PacketMultiplexer::new();
         let mut socket = bind().await.unwrap();
-        let shutdown_status = tcp_streams.run(socket.incoming());
+        let local_addr = socket.local_addr().unwrap();
 
-        let mut stream = tokio::net::TcpStream::connect(socket.local_addr().unwrap())
-            .await
-            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(local_addr).await.unwrap();
         let (_rx, _tx) = stream.split();
         stream.shutdown(std::net::Shutdown::Both).unwrap();
 
+        let control_stream = stream::once(async { ControlMessage::Shutdown });
+        let mut tcp_streams = PacketMultiplexer::new();
+        let shutdown_status =
+            tokio::task::spawn(
+                async move { tcp_streams.run(socket.incoming(), control_stream).await },
+            );
+
         assert!(shutdown_status.await.is_ok());
     }
-    */
 }
