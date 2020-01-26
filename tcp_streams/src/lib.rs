@@ -3,8 +3,8 @@ use bytes::Bytes;
 mod codec;
 use codec::*;
 
-mod stream_control;
-use stream_control::*;
+mod halt;
+use halt::*;
 
 mod sender;
 use sender::*;
@@ -37,74 +37,9 @@ pub struct OutgoingPacket {
     bytes: Bytes,
 }
 
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub enum ControlMessage {
     Shutdown,
 }
 
 type StreamId = usize;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use futures::stream;
-    use tokio::net::TcpListener;
-
-    pub async fn bind() -> IoResult<TcpListener> {
-        tracing::info!("Starting");
-        let addrs = "127.0.0.1:0".to_string();
-        tracing::info!("Binding to {:?}", &addrs);
-        TcpListener::bind(&addrs).await
-    }
-
-    #[tokio::test(basic_scheduler)]
-    async fn shutdown() {
-        let mut socket = bind().await.unwrap();
-        let control_stream = stream::once(async { ControlMessage::Shutdown });
-        let mut tcp_streams = PacketMultiplexer::new();
-        let shutdown_status =
-            tokio::task::spawn(
-                async move { tcp_streams.run(socket.incoming(), control_stream).await },
-            );
-
-        assert!(shutdown_status.await.is_ok());
-    }
-
-    #[tokio::test(basic_scheduler)]
-    async fn socket_shutdown() {
-        let mut socket = bind().await.unwrap();
-        let local_addr = socket.local_addr().unwrap();
-
-        let mut stream = tokio::net::TcpStream::connect(local_addr).await.unwrap();
-        let (_rx, _tx) = stream.split();
-        stream.shutdown(std::net::Shutdown::Both).unwrap();
-
-        let control_stream = stream::once(async { ControlMessage::Shutdown });
-        let mut tcp_streams = PacketMultiplexer::new();
-        let shutdown_status =
-            tokio::task::spawn(
-                async move { tcp_streams.run(socket.incoming(), control_stream).await },
-            );
-
-        assert!(shutdown_status.await.is_ok());
-    }
-
-    #[tokio::test(basic_scheduler)]
-    async fn write_packets() {
-        let mut socket = bind().await.unwrap();
-        let local_addr = socket.local_addr().unwrap();
-
-        let mut stream = tokio::net::TcpStream::connect(local_addr).await.unwrap();
-        let (_rx, _tx) = stream.split();
-        stream.shutdown(std::net::Shutdown::Both).unwrap();
-
-        let control_stream = stream::once(async { ControlMessage::Shutdown });
-        let mut tcp_streams = PacketMultiplexer::new();
-        let shutdown_status =
-            tokio::task::spawn(
-                async move { tcp_streams.run(socket.incoming(), control_stream).await },
-            );
-
-        assert!(shutdown_status.await.is_ok());
-    }
-}

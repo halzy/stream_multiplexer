@@ -24,6 +24,7 @@ where
     prev_stream_id: StreamId,
     senders: HashMap<StreamId, Sender<T, PacketWriter>>,
 }
+
 impl<T> std::fmt::Debug for PacketMultiplexer<T>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -150,5 +151,15 @@ where
             )),
             Some(sender) => sender.send(bytes).await,
         }
+    }
+}
+
+#[cfg(test)]
+impl<T> PacketMultiplexer<T>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    pub fn prev_stream_id(&self) -> StreamId {
+        self.prev_stream_id
     }
 }

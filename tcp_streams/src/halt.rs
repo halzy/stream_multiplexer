@@ -169,7 +169,7 @@ mod tests {
         assert!(reader.read_u8().now_or_never().is_none());
 
         // Send the writer to finish the shutdown
-        stop_tx.send(writer);
+        stop_tx.send(writer).unwrap();
 
         // check that reading has stopped
         assert_eq!(
