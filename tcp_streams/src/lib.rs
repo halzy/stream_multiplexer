@@ -25,21 +25,32 @@ fn listen_address() -> impl tokio::net::ToSocketAddrs + std::fmt::Debug {
     }
 }
 */
+type StreamId = usize;
+
+pub trait IdGen: Default {
+    fn next(&mut self) -> StreamId;
+    fn id(&self) -> StreamId;
+    fn seed(&mut self, _seed: usize) {}
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct IncomingPacket {
-    stream_id: StreamId,
+    id: StreamId,
     bytes: Bytes,
 }
-#[derive(Clone, PartialEq, Debug)]
+
+#[derive(Default, Clone, PartialEq, Debug)]
 pub struct OutgoingPacket {
-    stream_ids: Vec<StreamId>,
+    ids: Vec<StreamId>,
     bytes: Bytes,
+}
+impl OutgoingPacket {
+    pub fn new(ids: Vec<StreamId>, bytes: Bytes) -> Self {
+        Self { ids, bytes }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum ControlMessage {
     Shutdown,
 }
-
-type StreamId = usize;

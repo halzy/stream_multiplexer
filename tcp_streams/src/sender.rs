@@ -8,7 +8,7 @@ use tokio_util::codec::{Encoder, FramedWrite};
 
 use std::io::Result as IoResult;
 
-pub(crate) struct Sender<T, C> {
+pub struct Sender<T, C> {
     sender: FramedWrite<WriteHalf<T>, C>,
     read_halt: HaltRead,
     writer_tx: oneshot::Sender<WriteHalf<T>>,
@@ -44,6 +44,7 @@ where
     }
 
     pub async fn send(&mut self, bytes: Bytes) -> IoResult<()> {
+        eprintln!("sending bytes! {}", bytes.len());
         self.sender.send(bytes).await
     }
 }
