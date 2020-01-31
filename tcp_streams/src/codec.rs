@@ -5,13 +5,14 @@ use bytes::buf::BufMut;
 use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub struct PacketWriter {}
 impl Encoder for PacketWriter {
     type Item = Bytes;
     type Error = std::io::Error;
 
+    #[tracing::instrument(level = "trace", skip(self))]
     fn encode(&mut self, bytes: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        eprintln!("encode: {:#?}", bytes);
         let length = bytes.len();
         dst.reserve(length + 2); // +2 for size header
         dst.put_u16(length as u16); // Header
@@ -34,8 +35,8 @@ impl Decoder for PacketReader {
     type Item = IncomingPacket;
     type Error = std::io::Error;
 
+    #[tracing::instrument(level = "trace", skip(self))]
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        tracing::trace!("decode: {:#?}", src);
         let size = {
             if src.len() < 2 {
                 return Ok(None);

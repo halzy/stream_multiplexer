@@ -9,10 +9,16 @@ use halt::*;
 mod sender;
 use sender::*;
 
+mod id_gen;
+pub use id_gen::*;
+
 mod multiplexer;
 pub use multiplexer::*;
 
-/*
+mod multiplexer_senders;
+pub use multiplexer_senders::*;
+
+/* FIXME: move me!
 fn listen_address() -> impl tokio::net::ToSocketAddrs + std::fmt::Debug {
     if cfg!(test) {
         // the :0 gives us a random port, chosen by the OS
@@ -26,12 +32,6 @@ fn listen_address() -> impl tokio::net::ToSocketAddrs + std::fmt::Debug {
 }
 */
 type StreamId = usize;
-
-pub trait IdGen: Default {
-    fn next(&mut self) -> StreamId;
-    fn id(&self) -> StreamId;
-    fn seed(&mut self, _seed: usize) {}
-}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct IncomingPacket {

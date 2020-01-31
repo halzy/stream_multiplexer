@@ -1,79 +1,40 @@
 use super::{
-    ControlMessage, HaltAsyncRead, HaltRead, IdGen, OutgoingPacket, PacketReader, PacketWriter,
-    Sender, StreamId, StreamShutdown,
+    ControlMessage, HaltAsyncRead, HaltRead, IdGen, IncrementIdGen, MultiplexerSenders,
+    OutgoingPacket, PacketReader, PacketWriter, Sender, StreamId, StreamShutdown,
 };
 
 use bytes::Bytes;
-use futures::stream::{SelectAll, StreamExt};
-use std::io::Result as IoResult;
-use std::io::{Error, ErrorKind};
+use futures::stream::SelectAll;
+use std::io::{Error, ErrorKind, Result as IoResult};
 use tokio::io::{ReadHalf, WriteHalf};
-use tokio::stream::Stream;
+use tokio::stream::{Stream, StreamExt};
 use tokio::sync::oneshot;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use std::collections::HashMap;
+#[derive(Debug)]
+pub struct TcpStreamProducer {
+    inner: tokio::net::TcpListener,
+}
+impl TcpStreamProducer {
+    pub fn new(inner: tokio::net::TcpListener) -> Self {
+        Self { inner }
+    }
+}
+impl futures::Stream for TcpStreamProducer {
+    type Item = Result<tokio::net::TcpStream, std::io::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        ctx: &mut std::task::Context,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // Result<(stream, sockaddr), _> => Option<Result<stream, _>>
+        self.inner
+            .poll_accept(ctx)
+            .map_ok(|(s, _)| s)
+            .map(Into::into)
+    }
+}
 
 type Readers<T> = SelectAll<FramedRead<HaltAsyncRead<T>, PacketReader>>;
-
-type MultiplexerSender<T> = Sender<T, PacketWriter>;
-
-pub struct MultiplexerSenders<T, I: IdGen = IncrementIdGen> {
-    id_gen: I,
-    senders: HashMap<StreamId, MultiplexerSender<T>>,
-}
-impl<T, I> MultiplexerSenders<T, I>
-where
-    I: IdGen,
-{
-    pub fn get_mut(&mut self, stream_id: &StreamId) -> Option<&mut MultiplexerSender<T>> {
-        self.senders.get_mut(stream_id)
-    }
-
-    pub fn get(&mut self, stream_id: &StreamId) -> Option<&MultiplexerSender<T>> {
-        self.senders.get(stream_id)
-    }
-
-    pub fn remove(&mut self, stream_id: &StreamId) -> Option<MultiplexerSender<T>> {
-        self.senders.remove(stream_id)
-    }
-
-    pub fn insert(&mut self, sender: MultiplexerSender<T>) -> StreamId {
-        loop {
-            let id = self.id_gen.next();
-            eprintln!("insert: {}", &id);
-
-            if !self.senders.contains_key(&id) {
-                let res = self.senders.insert(id, sender);
-                assert!(res.is_none(), "MPSender: Highly unlikely");
-                break id;
-            }
-        }
-    }
-}
-impl<T, I> MultiplexerSenders<T, I>
-where
-    I: IdGen,
-{
-    pub fn new(id_gen: I) -> Self {
-        Self {
-            id_gen,
-            senders: HashMap::new(),
-        }
-    }
-}
-
-impl<T, I> Default for MultiplexerSenders<T, I>
-where
-    I: IdGen,
-{
-    fn default() -> Self {
-        Self {
-            id_gen: Default::default(),
-            senders: HashMap::new(),
-        }
-    }
-}
 
 pub struct PacketMultiplexer<S, T, I: IdGen = IncrementIdGen>
 where
@@ -85,10 +46,11 @@ where
     outgoing: S,
 }
 
-impl<S, T> std::fmt::Debug for PacketMultiplexer<S, T>
+impl<S, T, I> std::fmt::Debug for PacketMultiplexer<S, T, I>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     S: Stream<Item = OutgoingPacket>,
+    I: IdGen,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PacketMultiplexer ").finish()
@@ -138,19 +100,25 @@ where
     I: IdGen,
     S: Stream<Item = OutgoingPacket> + Unpin,
 {
-    pub async fn run<V, U>(&mut self, mut incoming: V, mut control: U) -> IoResult<()>
+    #[tracing::instrument(level = "debug", skip(incoming, control))]
+    pub async fn run<V, U>(mut self, mut incoming: V, mut control: U) -> IoResult<()>
     where
-        V: Stream<Item = IoResult<T>> + Unpin,
-        U: Stream<Item = ControlMessage> + Unpin,
+        V: Stream<Item = IoResult<T>> + std::fmt::Debug + Unpin,
+        U: Stream<Item = ControlMessage> + std::fmt::Debug + Unpin,
     {
         tracing::info!("Waiting for connections");
 
         loop {
             tokio::select!(
                 incoming_opt = incoming.next() => {
-                    eprintln!("incoming connection");
-                    if let Some(stream) = incoming_opt {
-                        self.handle_incoming_connection(stream);
+                    match incoming_opt {
+                        Some(Ok(stream)) => {
+                            self.handle_incoming_connection(stream);
+                        }
+                        Some(Err(error)) => {
+                            tracing::error!("ERROR: {}", error);
+                        }
+                        None => unreachable!()
                     }
                 }
                 outgoing_opt = self.outgoing.next() => {
@@ -169,39 +137,37 @@ where
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, packet))]
     async fn handle_outgoing_packet(&mut self, packet: OutgoingPacket) {
         for id in packet.ids.iter().copied() {
+            tracing::trace!(stream=?id, bytes=?packet.bytes, "sending");
             // FIXME: What should we do if there are send errors?
             if let Err(error) = self.send(id, packet.bytes.clone()).await {
-                eprintln!("outgoing packet error: {}", error);
+                tracing::error!(%error, "outgoing packet");
             }
         }
     }
 
-    fn handle_incoming_connection(&mut self, incoming_res: Result<T, std::io::Error>) {
-        match incoming_res {
-            Ok(stream) => {
-                tracing::trace!("new stream! {:?}", &stream);
-                // Add it to the hashmap so that we own it
-                let (rx, tx): (ReadHalf<T>, WriteHalf<T>) = tokio::io::split(stream);
-                let (writer_sender, writer_receiver) = oneshot::channel();
+    #[tracing::instrument(level = "trace", skip(self, stream))]
+    fn handle_incoming_connection(&mut self, stream: T) {
+        tracing::trace!(?stream, "new connection");
+        // Add it to the hashmap so that we own it
+        let (rx, tx): (ReadHalf<T>, WriteHalf<T>) = tokio::io::split(stream);
+        let (writer_sender, writer_receiver) = oneshot::channel();
 
-                let (halt, async_read_halt) = HaltRead::wrap(rx, writer_receiver);
+        let (halt, async_read_halt) = HaltRead::wrap(rx, writer_receiver);
 
-                let framed_write = FramedWrite::new(tx, PacketWriter {});
-                let sender = Sender::new(framed_write, halt, writer_sender);
-                let stream_id = self.senders.insert(sender);
+        let framed_write = FramedWrite::new(tx, PacketWriter {});
+        let sender = Sender::new(framed_write, halt, writer_sender);
+        let stream_id = self.senders.insert(sender);
 
-                let framed_read = FramedRead::new(async_read_halt, PacketReader::new(stream_id));
-                self.readers.push(framed_read);
-            }
-            Err(error) => {
-                tracing::error!("ERROR: {}", error);
-            }
-        }
+        let framed_read = FramedRead::new(async_read_halt, PacketReader::new(stream_id));
+        self.readers.push(framed_read);
     }
 
+    #[tracing::instrument(level = "trace", skip(stream_id))]
     pub async fn close_stream(&mut self, stream_id: StreamId) -> IoResult<()> {
+        tracing::trace!(%stream_id, "attempt to close stream");
         // is it in the map?
         match self.senders.remove(&stream_id) {
             // borrow the stream from the writer
@@ -216,8 +182,9 @@ where
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(stream_id, bytes))]
     pub async fn send(&mut self, stream_id: StreamId, bytes: Bytes) -> IoResult<()> {
-        eprintln!("sending to {}, {} bytes", stream_id, bytes.len());
+        tracing::trace!(%stream_id, ?bytes, "sending");
         match self.senders.get_mut(&stream_id) {
             None => Err(Error::new(
                 ErrorKind::Other,
@@ -225,43 +192,5 @@ where
             )),
             Some(sender) => sender.send(bytes).await,
         }
-    }
-}
-
-#[derive(Default, Copy, Clone, PartialEq, Debug)]
-pub struct IncrementIdGen {
-    id: StreamId,
-}
-impl IdGen for IncrementIdGen {
-    /// Find the next available StreamId
-    fn next(&mut self) -> StreamId {
-        self.id = self.id.wrapping_add(1);
-        self.id
-    }
-    fn id(&self) -> StreamId {
-        self.id
-    }
-    fn seed(&mut self, seed: StreamId) {
-        self.id = seed;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn increment() {
-        let mut id = IncrementIdGen::default();
-
-        id.seed(usize::max_value());
-        assert_eq!(usize::max_value(), id.id());
-
-        let zero = id.next();
-        assert_eq!(0, zero);
-
-        let one = id.next();
-        assert_eq!(1, one);
-        assert_eq!(one, id.id());
     }
 }

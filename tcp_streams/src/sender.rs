@@ -8,12 +8,14 @@ use tokio_util::codec::{Encoder, FramedWrite};
 
 use std::io::Result as IoResult;
 
+#[derive(Debug)]
 pub struct Sender<T, C> {
     sender: FramedWrite<WriteHalf<T>, C>,
     read_halt: HaltRead,
     writer_tx: oneshot::Sender<WriteHalf<T>>,
 }
 impl<T, C> Sender<T, C> {
+    #[tracing::instrument(level = "trace", skip(sender, read_halt, writer_tx))]
     pub fn new(
         sender: FramedWrite<WriteHalf<T>, C>,
         read_halt: HaltRead,
@@ -31,6 +33,7 @@ where
     T: tokio::io::AsyncWrite + Unpin + std::fmt::Debug,
     C: Encoder<Item = Bytes, Error = std::io::Error>,
 {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn shutdown(self) -> IoResult<()> {
         let mut write_half = self.sender.into_inner();
 
@@ -43,8 +46,8 @@ where
         result
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn send(&mut self, bytes: Bytes) -> IoResult<()> {
-        eprintln!("sending bytes! {}", bytes.len());
         self.sender.send(bytes).await
     }
 }

@@ -17,26 +17,31 @@ pub trait StreamShutdown {
 }
 
 impl StreamShutdown for TcpStream {
+    #[tracing::instrument(level = "trace", skip(self))]
     fn shutdown(&self) -> TioResult<()> {
         self.shutdown(Shutdown::Read)
     }
 }
 
+#[derive(Debug)]
 struct Inner {
     waker: AtomicWaker,
     set: AtomicBool,
 }
 
+#[derive(Clone, Debug)]
 pub struct HaltRead {
     inner: Arc<Inner>,
 }
 
 impl HaltRead {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn signal(&self) {
         self.inner.set.store(true, Relaxed);
         self.inner.waker.wake();
     }
 
+    #[tracing::instrument(level = "trace", skip(read, writer))]
     pub fn wrap<T>(
         read: ReadHalf<T>,
         writer: oneshot::Receiver<WriteHalf<T>>,
@@ -70,6 +75,7 @@ impl<T> HaltAsyncRead<T>
 where
     T: StreamShutdown,
 {
+    #[tracing::instrument(level = "trace", skip(self))]
     fn shutdown(&mut self) -> Poll<TioResult<usize>> {
         use tokio::sync::oneshot::error::TryRecvError;
 
@@ -108,6 +114,7 @@ impl<T> AsyncRead for HaltAsyncRead<T>
 where
     T: StreamShutdown + AsyncRead + AsyncWrite,
 {
+    #[tracing::instrument(level = "trace", skip(self))]
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
