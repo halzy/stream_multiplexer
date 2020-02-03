@@ -14,12 +14,12 @@ where
     T: std::fmt::Debug,
     I: IdGen,
 {
-    pub fn get_mut(&mut self, stream_id: &StreamId) -> Option<&mut MultiplexerSender<T>> {
-        self.senders.get_mut(stream_id)
+    pub fn get_mut(&mut self, stream_id: StreamId) -> Option<&mut MultiplexerSender<T>> {
+        self.senders.get_mut(&stream_id)
     }
 
-    pub fn get(&mut self, stream_id: &StreamId) -> Option<&MultiplexerSender<T>> {
-        self.senders.get(stream_id)
+    pub fn get(&mut self, stream_id: StreamId) -> Option<&MultiplexerSender<T>> {
+        self.senders.get(&stream_id)
     }
 
     #[tracing::instrument(level = "trace", skip(stream_id))]

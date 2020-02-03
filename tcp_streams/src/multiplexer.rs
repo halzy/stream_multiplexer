@@ -191,7 +191,7 @@ where
     #[tracing::instrument(level = "trace", skip(stream_id, bytes))]
     pub async fn send(&mut self, stream_id: StreamId, bytes: Bytes) -> IoResult<()> {
         tracing::trace!(%stream_id, ?bytes, "sending");
-        match self.senders.get_mut(&stream_id) {
+        match self.senders.get_mut(stream_id) {
             None => Err(Error::new(
                 ErrorKind::Other,
                 format!("Sending to non-existent stream: {}", stream_id),
