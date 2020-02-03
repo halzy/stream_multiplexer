@@ -34,9 +34,15 @@ fn listen_address() -> impl tokio::net::ToSocketAddrs + std::fmt::Debug {
 type StreamId = usize;
 
 #[derive(Clone, PartialEq, Debug)]
+pub enum IncomingMessage {
+    Bytes(Bytes),
+    Linkdead,
+}
+
+#[derive(Clone, PartialEq, Debug)]
 pub struct IncomingPacket {
     id: StreamId,
-    bytes: Bytes,
+    message: IncomingMessage,
 }
 
 #[derive(Default, Clone, PartialEq, Debug)]

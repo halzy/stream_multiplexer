@@ -1,8 +1,9 @@
-use super::{IdGen, IncrementIdGen, PacketWriter, Sender, StreamId};
+use super::{IdGen, IncrementIdGen, Sender, StreamId};
 
 use std::collections::HashMap;
+use tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-type MultiplexerSender<T> = Sender<T, PacketWriter>;
+type MultiplexerSender<T> = Sender<T, LengthDelimitedCodec>;
 
 pub struct MultiplexerSenders<T, I: IdGen = IncrementIdGen> {
     id_gen: I,

@@ -1,6 +1,6 @@
 use super::{
     ControlMessage, HaltAsyncRead, HaltRead, IdGen, IncrementIdGen, MultiplexerSenders,
-    OutgoingPacket, PacketReader, PacketWriter, Sender, StreamId, StreamShutdown,
+    OutgoingPacket, PacketReader, Sender, StreamId, StreamShutdown,
 };
 
 use bytes::Bytes;
@@ -9,7 +9,8 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::oneshot;
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::codec::length_delimited::LengthDelimitedCodec;
+use tokio_util::codec::FramedRead;
 
 #[derive(Debug)]
 pub struct TcpStreamProducer {
@@ -34,20 +35,20 @@ impl futures::Stream for TcpStreamProducer {
     }
 }
 
-type Readers<T> = SelectAll<FramedRead<HaltAsyncRead<T>, PacketReader>>;
-
 pub struct PacketMultiplexer<S, T, I: IdGen = IncrementIdGen>
 where
+    T: StreamShutdown,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     S: Stream<Item = OutgoingPacket>,
 {
-    readers: Readers<T>,
+    readers: SelectAll<PacketReader<FramedRead<HaltAsyncRead<T>, LengthDelimitedCodec>>>,
     senders: MultiplexerSenders<T, I>,
     outgoing: S,
 }
 
 impl<S, T, I> std::fmt::Debug for PacketMultiplexer<S, T, I>
 where
+    T: StreamShutdown,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     S: Stream<Item = OutgoingPacket>,
     I: IdGen,
@@ -157,12 +158,17 @@ where
 
         let (halt, async_read_halt) = HaltRead::wrap(rx, writer_receiver);
 
-        let framed_write = FramedWrite::new(tx, PacketWriter {});
+        let framed_write = LengthDelimitedCodec::builder()
+            .length_field_length(2)
+            .new_write(tx);
         let sender = Sender::new(framed_write, halt, writer_sender);
         let stream_id = self.senders.insert(sender);
 
-        let framed_read = FramedRead::new(async_read_halt, PacketReader::new(stream_id));
-        self.readers.push(framed_read);
+        let framed_read = LengthDelimitedCodec::builder()
+            .length_field_length(2)
+            .new_read(async_read_halt);
+        let reader = PacketReader::new(stream_id, framed_read);
+        self.readers.push(reader);
     }
 
     #[tracing::instrument(level = "trace", skip(stream_id))]
