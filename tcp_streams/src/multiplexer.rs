@@ -5,35 +5,13 @@ use super::{
 
 use bytes::Bytes;
 use futures::stream::SelectAll;
-use std::io::{Error, ErrorKind, Result as IoResult};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::oneshot;
 use tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use tokio_util::codec::FramedRead;
 
-#[derive(Debug)]
-pub struct TcpStreamProducer {
-    inner: tokio::net::TcpListener,
-}
-impl TcpStreamProducer {
-    pub fn new(inner: tokio::net::TcpListener) -> Self {
-        Self { inner }
-    }
-}
-impl futures::Stream for TcpStreamProducer {
-    type Item = Result<tokio::net::TcpStream, std::io::Error>;
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        ctx: &mut std::task::Context,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        // Result<(stream, sockaddr), _> => Option<Result<stream, _>>
-        self.inner
-            .poll_accept(ctx)
-            .map_ok(|(s, _)| s)
-            .map(Into::into)
-    }
-}
+use std::io::{Error, ErrorKind, Result as IoResult};
 
 pub struct PacketMultiplexer<S, T, I: IdGen = IncrementIdGen>
 where
@@ -74,6 +52,10 @@ where
             outgoing,
         }
     }
+
+    pub fn reader_stream(&mut self) -> impl Stream + '_ {
+        &mut self.readers
+    }
 }
 
 impl<S, T, I> PacketMultiplexer<S, T, I>
@@ -104,8 +86,8 @@ where
     #[tracing::instrument(level = "debug", skip(incoming, control))]
     pub async fn run<V, U>(mut self, mut incoming: V, mut control: U) -> IoResult<()>
     where
-        V: Stream<Item = IoResult<T>> + std::fmt::Debug + Unpin,
-        U: Stream<Item = ControlMessage> + std::fmt::Debug + Unpin,
+        V: Stream<Item = IoResult<T>> + Unpin,
+        U: Stream<Item = ControlMessage> + Unpin,
     {
         tracing::info!("Waiting for connections");
 
@@ -156,6 +138,7 @@ where
         let (rx, tx): (ReadHalf<T>, WriteHalf<T>) = tokio::io::split(stream);
         let (writer_sender, writer_receiver) = oneshot::channel();
 
+        // used to re-join the two halves so that we can shut down the reader
         let (halt, async_read_halt) = HaltRead::wrap(rx, writer_receiver);
 
         let framed_write = LengthDelimitedCodec::builder()

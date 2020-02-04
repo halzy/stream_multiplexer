@@ -4,19 +4,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
-pub struct PacketReader<S>
-where
-    //S: futures::stream::Stream<Item = Result<bytes::BytesMut, std::io::Error>>,
-    S: futures::stream::Stream,
-{
+pub struct PacketReader<S> {
     stream_id: StreamId,
     inner: S,
 }
-impl<S> PacketReader<S>
-where
-    //S: futures::stream::Stream<Item = Result<bytes::BytesMut, std::io::Error>>,
-    S: futures::stream::Stream,
-{
+impl<S> PacketReader<S> {
     pub fn new(stream_id: StreamId, inner: S) -> Self {
         Self { stream_id, inner }
     }

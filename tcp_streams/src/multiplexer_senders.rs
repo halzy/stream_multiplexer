@@ -5,6 +5,7 @@ use tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
 type MultiplexerSender<T> = Sender<T, LengthDelimitedCodec>;
 
+/// Stores MultiplexerSender and provides a generated ID
 pub struct MultiplexerSenders<T, I: IdGen = IncrementIdGen> {
     id_gen: I,
     senders: HashMap<StreamId, MultiplexerSender<T>>,
