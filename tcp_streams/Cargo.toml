@@ -20,4 +20,4 @@ tracing-futures = "0.2"
 [dev-dependencies]
 tokio = { version = "0.2", features = ["full", "test-util"] }
 matches = "0.1"
-tracing-subscriber = "0.1"
+tracing-subscriber = "0.2"
