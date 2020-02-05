@@ -34,6 +34,14 @@ pub struct IncomingPacket {
     id: StreamId,
     message: IncomingMessage,
 }
+impl IncomingPacket {
+    pub fn id(&self) -> StreamId {
+        self.id
+    }
+    pub fn message(&self) -> &IncomingMessage {
+        &self.message
+    }
+}
 
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct OutgoingPacket {

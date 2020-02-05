@@ -23,13 +23,17 @@ where
     #[tracing::instrument(level = "trace", skip(self, ctx))]
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
         let inner_pin = Pin::new(&mut self.inner);
+        tracing::trace!("poll_next()");
         match futures::ready!(inner_pin.poll_next(ctx)) {
             None => None.into(),
-            Some(Ok(bytes)) => Some(Ok(IncomingPacket {
-                id: self.stream_id,
-                message: IncomingMessage::Bytes(bytes.freeze()),
-            }))
-            .into(),
+            Some(Ok(bytes)) => {
+                tracing::trace!(?bytes, "reading");
+                Some(Ok(IncomingPacket {
+                    id: self.stream_id,
+                    message: IncomingMessage::Bytes(bytes.freeze()),
+                }))
+                .into()
+            }
             Some(Err(error)) => Some(Err(error)).into(),
         }
     }
