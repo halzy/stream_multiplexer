@@ -50,14 +50,8 @@ where
     Out: Stream<Item = OutgoingPacket>,
 {
     pub fn new(outgoing: Out, incoming_packet_sink: IncomingPacketSink) -> Self {
-        let readers = SelectAll::new();
-        let senders = MultiplexerSenders::default();
-        Self {
-            readers: Some(readers),
-            senders,
-            outgoing,
-            incoming_packet_sink: Some(incoming_packet_sink),
-        }
+        let senders = MultiplexerSenders::new(IncrementIdGen::default());
+        Self::with_senders(senders, outgoing, incoming_packet_sink)
     }
 }
 
@@ -115,10 +109,12 @@ where
         tokio::task::spawn(async move {
             let mut incoming_packet: Option<IncomingPacket> = None;
             loop {
+                tracing::trace!(?incoming_packet, "incoming loop start");
                 match incoming_packet.clone() {
                     // We do not have an incoming packet
                     None => tokio::select!(
                         packet_reader = incoming_packet_reader_rx.recv() => {
+                            tracing::trace!(?packet_reader, "incoming socket (none)");
                             match packet_reader {
                                 Some(packet_reader) => {
                                     readers.push(packet_reader);
@@ -130,6 +126,7 @@ where
                             }
                         }
                         packet_res = readers.next(), if !readers.is_empty() => {
+                            tracing::trace!(?packet_res, "incoming data");
                             match packet_res {
                                 Some(Ok(packet)) => {
                                     incoming_packet.replace(packet);
@@ -146,6 +143,7 @@ where
                     // We HAVE an incoming packet
                     Some(packet) => tokio::select!(
                         packet_reader = incoming_packet_reader_rx.recv() => {
+                            tracing::trace!(?packet_reader, "incoming socket (some)");
                             match packet_reader {
                                 Some(packet_reader) => {
                                     readers.push(packet_reader);
@@ -157,6 +155,7 @@ where
                             }
                         }
                         send_result = incoming_packet_sink.send(packet) => {
+                            tracing::trace!(?send_result, "sending data");
                             // We have to convert the option back to None
                             incoming_packet.take();
 

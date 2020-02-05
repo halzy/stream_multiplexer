@@ -66,6 +66,7 @@ impl HaltRead {
     }
 }
 
+#[derive(Debug)]
 pub struct HaltAsyncRead<T> {
     inner: Arc<Inner>,
     read: Option<ReadHalf<T>>,

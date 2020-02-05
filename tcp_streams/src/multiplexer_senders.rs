@@ -55,17 +55,6 @@ where
     }
 }
 
-impl<T, I> Default for MultiplexerSenders<T, I>
-where
-    I: IdGen,
-{
-    fn default() -> Self {
-        Self {
-            id_gen: Default::default(),
-            senders: HashMap::new(),
-        }
-    }
-}
 impl<T, I> std::fmt::Debug for MultiplexerSenders<T, I>
 where
     I: IdGen,
