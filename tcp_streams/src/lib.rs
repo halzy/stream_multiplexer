@@ -21,6 +21,9 @@ pub use multiplexer_senders::*;
 mod stream_producer;
 pub use stream_producer::*;
 
+mod stream_mover;
+use stream_mover::*;
+
 type StreamId = usize;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -43,14 +46,20 @@ impl IncomingPacket {
     }
 }
 
-#[derive(Default, Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum OutgoingMessage {
+    Bytes(Bytes),
+    ChangeChannel(usize),
+}
+
+#[derive(Clone, PartialEq, Debug)]
 pub struct OutgoingPacket {
     ids: Vec<StreamId>,
-    bytes: Bytes,
+    message: OutgoingMessage,
 }
 impl OutgoingPacket {
-    pub fn new(ids: Vec<StreamId>, bytes: Bytes) -> Self {
-        Self { ids, bytes }
+    pub fn new(ids: Vec<StreamId>, message: OutgoingMessage) -> Self {
+        Self { ids, message }
     }
 }
 

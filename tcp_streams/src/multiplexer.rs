@@ -1,6 +1,7 @@
 use super::{
     ControlMessage, HaltAsyncRead, HaltRead, IdGen, IncomingPacket, IncrementIdGen,
-    MultiplexerSenders, OutgoingPacket, PacketReader, Sender, StreamId, StreamShutdown,
+    MultiplexerSenders, OutgoingMessage, OutgoingPacket, PacketReader, Sender, StreamId,
+    StreamShutdown,
 };
 
 use bytes::Bytes;
@@ -24,10 +25,10 @@ where
     T: Unpin,
     Out: Stream<Item = OutgoingPacket>,
 {
-    readers: Option<SelectAll<IncomingPacketReader<T>>>,
+    readers: Option<Vec<SelectAll<IncomingPacketReader<T>>>>,
     senders: MultiplexerSenders<T, I>,
     outgoing: Out,
-    incoming_packet_sink: Option<IncomingPacketSink>,
+    incoming_packet_sinks: Option<Vec<IncomingPacketSink>>,
 }
 
 impl<Out, T, I> std::fmt::Debug for PacketMultiplexer<Out, T, I>
@@ -49,9 +50,9 @@ where
     T: Unpin,
     Out: Stream<Item = OutgoingPacket>,
 {
-    pub fn new(outgoing: Out, incoming_packet_sink: IncomingPacketSink) -> Self {
+    pub fn new(outgoing: Out, incoming_packet_sinks: Vec<IncomingPacketSink>) -> Self {
         let senders = MultiplexerSenders::new(IncrementIdGen::default());
-        Self::with_senders(senders, outgoing, incoming_packet_sink)
+        Self::with_senders(senders, outgoing, incoming_packet_sinks)
     }
 }
 
@@ -66,14 +67,22 @@ where
     pub fn with_senders(
         senders: MultiplexerSenders<T, I>,
         outgoing: S,
-        incoming_packet_sink: IncomingPacketSink,
+        incoming_packet_sinks: Vec<IncomingPacketSink>,
     ) -> Self {
-        let readers = SelectAll::new();
+        if incoming_packet_sinks.is_empty() {
+            panic!("Must have at least one packet sink");
+        }
+
+        let readers = (0..incoming_packet_sinks.len())
+            .into_iter()
+            .map(|_| SelectAll::new())
+            .collect();
+
         Self {
             senders,
             outgoing,
             readers: Some(readers),
-            incoming_packet_sink: Some(incoming_packet_sink),
+            incoming_packet_sinks: Some(incoming_packet_sinks),
         }
     }
 }
@@ -96,75 +105,34 @@ where
         U: Stream<Item = ControlMessage> + Send + Unpin + 'static,
     {
         tracing::info!("Waiting for connections");
+        let mut readers = self.readers.take().expect("Should have readers!");
+        let mut incoming_packet_sinks = self
+            .incoming_packet_sinks
+            .take()
+            .expect("Should have incoming_packet_sinks!");
+
+        let channel_count = incoming_packet_sinks.len();
+        let mut incoming_packet_readers_tx = Vec::with_capacity(channel_count);
+
+        for _ in 0..channel_count {
+            let reader = readers.remove(0);
+            let incoming_packet_sink = incoming_packet_sinks.remove(0);
+
+            let (incoming_packet_reader_tx, incoming_packet_reader_rx) = mpsc::unbounded_channel();
+            incoming_packet_readers_tx.push(incoming_packet_reader_tx);
+
+            Self::run_channel(reader, incoming_packet_sink, incoming_packet_reader_rx);
+        }
 
         let (mut incoming_packet_reader_tx, mut incoming_packet_reader_rx) =
             mpsc::unbounded_channel();
 
-        let mut readers = self.readers.take().expect("Should have readers!");
-        let mut incoming_packet_sink = self
-            .incoming_packet_sink
-            .take()
-            .expect("Should have incoming_packet_sink!");
-
         tokio::task::spawn(async move {
-            let mut incoming_packet: Option<IncomingPacket> = None;
-            loop {
-                tracing::trace!(?incoming_packet, "incoming loop start");
-                match incoming_packet.clone() {
-                    // We do not have an incoming packet
-                    None => tokio::select!(
-                        packet_reader = incoming_packet_reader_rx.recv() => {
-                            tracing::trace!(?packet_reader, "incoming socket (none)");
-                            match packet_reader {
-                                Some(packet_reader) => {
-                                    readers.push(packet_reader);
-                                }
-                                None => {
-                                    tracing::error!("incoming packet reader received None, exiting loop");
-                                    return;
-                                }
-                            }
-                        }
-                        packet_res = readers.next(), if !readers.is_empty() => {
-                            tracing::trace!(?packet_res, "incoming data");
-                            match packet_res {
-                                Some(Ok(packet)) => {
-                                    incoming_packet.replace(packet);
-                                }
-                                Some(Err(err)) => {
-                                    tracing::error!(?err, "Error multiplexing packet");
-                                }
-                                None => {
-                                    tracing::error!("incoming reader received None");
-                                }
-                            }
-                        }
-                    ),
-                    // We HAVE an incoming packet
-                    Some(packet) => tokio::select!(
-                        packet_reader = incoming_packet_reader_rx.recv() => {
-                            tracing::trace!(?packet_reader, "incoming socket (some)");
-                            match packet_reader {
-                                Some(packet_reader) => {
-                                    readers.push(packet_reader);
-                                }
-                                None => {
-                                    tracing::error!("incoming packet reader received None, exiting loop");
-                                    return;
-                                }
-                            }
-                        }
-                        send_result = incoming_packet_sink.send(packet) => {
-                            tracing::trace!(?send_result, "sending data");
-                            // We have to convert the option back to None
-                            incoming_packet.take();
-
-                            if let Err(err) = send_result {
-                                tracing::error!(?err, "Shutting down receive loop");
-                                return;
-                            }
-                        }
-                    ),
+            while let Some((channel, packet_reader)) = incoming_packet_reader_rx.recv().await {
+                let ipr_tx: &mpsc::UnboundedSender<IncomingPacketReader<T>> =
+                    &incoming_packet_readers_tx[channel];
+                if let Err(err) = ipr_tx.send(packet_reader) {
+                    tracing::error!(?err, "Error moving incoming stream to channel");
                 }
             }
         });
@@ -200,42 +168,139 @@ where
         })
     }
 
+    fn run_channel(
+        mut reader: SelectAll<IncomingPacketReader<T>>,
+        mut incoming_packet_sink: IncomingPacketSink,
+        mut incoming_packet_reader_rx: mpsc::UnboundedReceiver<IncomingPacketReader<T>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::task::spawn(async move {
+            let mut incoming_packet: Option<IncomingPacket> = None;
+            loop {
+                tracing::trace!(?incoming_packet, "incoming loop start");
+                match incoming_packet.clone() {
+                    // We do not have an incoming packet
+                    None => tokio::select!(
+                        // FIXME: This block is duplicated, down below
+                        packet_reader = incoming_packet_reader_rx.recv() => {
+                            tracing::trace!(?packet_reader, "incoming socket (none)");
+                            match packet_reader {
+                                Some(packet_reader) => {
+                                    reader.push(packet_reader);
+                                }
+                                None => {
+                                    tracing::error!("incoming packet reader received None, exiting loop");
+                                    return;
+                                }
+                            }
+                        }
+                        packet_res = reader.next(), if !reader.is_empty() => {
+                            tracing::trace!(?packet_res, "incoming data");
+                            match packet_res {
+                                Some(Ok(packet)) => {
+                                    incoming_packet.replace(packet);
+                                }
+                                Some(Err(err)) => {
+                                    tracing::error!(?err, "Error multiplexing packet");
+                                }
+                                None => {
+                                    tracing::error!("incoming reader received None");
+                                }
+                            }
+                        }
+                    ),
+                    // We HAVE an incoming packet
+                    Some(packet) => tokio::select!(
+                        // FIXME: This block is duplicated, up above
+                        packet_reader = incoming_packet_reader_rx.recv() => {
+                            tracing::trace!(?packet_reader, "incoming socket (some)");
+                            match packet_reader {
+                                Some(packet_reader) => {
+                                    reader.push(packet_reader);
+                                }
+                                None => {
+                                    tracing::error!("incoming packet reader received None, exiting loop");
+                                    return;
+                                }
+                            }
+                        }
+                        send_result = incoming_packet_sink.send(packet) => {
+                            tracing::trace!(?send_result, "sending data");
+                            // We have to convert the option back to None
+                            incoming_packet.take();
+
+                            if let Err(err) = send_result {
+                                tracing::error!(?err, "Shutting down receive loop");
+                                return;
+                            }
+                        }
+                    ),
+                }
+            }
+        })
+    }
+
     #[tracing::instrument(level = "trace", skip(self, packet))]
     async fn handle_outgoing_packet(&mut self, packet: OutgoingPacket) {
         for id in packet.ids.iter().copied() {
-            tracing::trace!(stream=?id, bytes=?packet.bytes, "sending");
-            // FIXME: What should we do if there are send errors?
-            if let Err(error) = self.send(id, packet.bytes.clone()).await {
-                tracing::error!(%error, "outgoing packet");
+            match &packet.message {
+                OutgoingMessage::Bytes(bytes) => {
+                    tracing::trace!(stream=?id, bytes=?bytes, "sending");
+                    // FIXME: What should we do if there are send errors?
+                    if let Err(error) = self.send(id, bytes.clone()).await {
+                        tracing::error!(%error, "outgoing packet");
+                    }
+                }
+                OutgoingMessage::ChangeChannel(channel) => {
+                    tracing::trace!(?id, ?channel, "change channel");
+                    self.change_channel(id, *channel);
+                }
             }
         }
+    }
+
+    fn change_channel(&self, _id: StreamId, _channel: usize) {
+        unimplemented!()
     }
 
     #[tracing::instrument(level = "trace", skip(self, stream))]
     fn handle_incoming_connection(
         &mut self,
         stream: T,
-        incoming_packet_reader_tx: &mut mpsc::UnboundedSender<IncomingPacketReader<T>>,
+        incoming_packet_reader_tx: &mut mpsc::UnboundedSender<(usize, IncomingPacketReader<T>)>,
     ) {
         tracing::trace!(?stream, "new connection");
         // Add it to the hashmap so that we own it
         let (rx, tx): (ReadHalf<T>, WriteHalf<T>) = tokio::io::split(stream);
+
+        // Used to send the writer to the reader when shutdown is needed
         let (writer_sender, writer_receiver) = oneshot::channel();
 
         // used to re-join the two halves so that we can shut down the reader
         let (halt, async_read_halt) = HaltRead::wrap(rx, writer_receiver);
 
+        // Keep track of the write_half and generate a stream_id
         let framed_write = LengthDelimitedCodec::builder()
             .length_field_length(2)
             .new_write(tx);
         let sender = Sender::new(framed_write, halt, writer_sender);
         let stream_id = self.senders.insert(sender);
 
+        // Wrap the reader a bit more, now in a codec
         let framed_read = LengthDelimitedCodec::builder()
             .length_field_length(2)
             .new_read(async_read_halt);
         let reader = PacketReader::new(stream_id, framed_read);
-        if let Err(_) = incoming_packet_reader_tx.send(reader) {
+
+        // Wrap the packet reader in a StreamMover
+
+        /*
+        Stream + Holds Another Stream + Can give up it's inner stream
+        takes oneshot::receiver<()> and listenes for when to give up it's inner steam
+        takes oneshot::sender<Stream..> and sends it's inner stream when told
+        */
+
+        // Send the PacketReader to channel zero
+        if let Err(_) = incoming_packet_reader_tx.send((0, reader)) {
             tracing::error!("Error enqueueing incoming connection");
         }
     }
