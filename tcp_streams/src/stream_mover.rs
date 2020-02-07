@@ -19,7 +19,6 @@ pub struct StreamMoverControl {
 }
 
 impl StreamMoverControl {
-    #[tracing::instrument(level = "trace", skip(self))]
     pub fn signal(&self) {
         self.inner.set.store(true, Relaxed);
         self.inner.waker.wake();
@@ -59,6 +58,7 @@ where
         match self.stream {
             None => Poll::Ready(None),
             Some(_) => {
+                tracing::trace!("giving up stream");
                 let move_channel = self.move_channel.take().unwrap();
                 let stream = self.stream.take().unwrap();
                 if let Err(_) = move_channel.send(stream) {
@@ -76,7 +76,7 @@ where
 {
     type Item = S::Item;
 
-    #[tracing::instrument(level = "trace", skip(self))]
+    #[tracing::instrument(level = "trace", skip(self, cx))]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<S::Item>> {
         // quick check to avoid registration if already done.
         if self.inner.set.load(Relaxed) {

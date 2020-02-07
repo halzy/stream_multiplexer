@@ -206,7 +206,8 @@ async fn change_channel() {
     let (data_write, data_read) = channel::unbounded_channel();
 
     // sharing the idgen so that we can get the client stream_ids
-    let id_gen: SharedIdGen<IncrementIdGen> = SharedIdGen::default();
+    let mut id_gen: SharedIdGen<IncrementIdGen> = SharedIdGen::default();
+    id_gen.seed(100);
     let senders = MultiplexerSenders::new(id_gen.clone());
     let (in_data_tx0, mut in_data_rx0) = channel::channel(10);
     let (in_data_tx1, mut in_data_rx1) = channel::channel(10);
@@ -220,12 +221,11 @@ async fn change_channel() {
     let mut client1 = tokio::net::TcpStream::connect(local_addr).await.unwrap();
     let client1_id = id_gen.wait_for_next_id().await;
 
-    // read multiplexed data from channel 0
-    //
-    // send a message
+    // send a message on channel 0
     let mut data = Bytes::from("\0\ta message");
     client1.write_buf(&mut data).await.unwrap();
 
+    // read multiplexed data from channel 0
     let incoming_packet = in_data_rx0.recv().await.unwrap();
     assert_eq!(incoming_packet.id(), client1_id);
     assert_eq!(
@@ -237,17 +237,30 @@ async fn change_channel() {
     let change_channel = OutgoingPacket::new(vec![client1_id], OutgoingMessage::ChangeChannel(1));
     data_write.send(change_channel);
 
-    // read multiplexed data from channel 1
-    //
-    // send a message
-    let mut data = Bytes::from("\0\ta message");
+    // send a message to the client (so that the client waits and we can change channels)
+    let data = Bytes::from("a message from the server");
+    data_write
+        .send(OutgoingPacket::new(
+            vec![client1_id],
+            OutgoingMessage::Bytes(data.clone()),
+        ))
+        .unwrap();
+
+    // client reads data
+    let mut read_data = BytesMut::new();
+    let _read_res = client1.read_buf(&mut read_data).await.unwrap();
+    assert_eq!(read_data, "\0\x19a message from the server".as_bytes());
+
+    // send a message to channel 1
+    let mut data = Bytes::from("\0\x10a second message");
     client1.write_buf(&mut data).await.unwrap();
 
+    // read multiplexed data from channel 1
     let incoming_packet = in_data_rx1.recv().await.unwrap();
     assert_eq!(incoming_packet.id(), client1_id);
     assert_eq!(
         incoming_packet.message(),
-        &IncomingMessage::Bytes(Bytes::from("a message"))
+        &IncomingMessage::Bytes(Bytes::from("a second message"))
     );
 
     // cleanup

@@ -1,8 +1,4 @@
-use super::{
-    ControlMessage, HaltAsyncRead, HaltRead, IdGen, IncomingPacket, IncrementIdGen,
-    MultiplexerSenders, OutgoingMessage, OutgoingPacket, PacketReader, Sender, StreamId,
-    StreamShutdown,
-};
+use super::*;
 
 use bytes::Bytes;
 use futures::stream::SelectAll;
@@ -13,10 +9,20 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use tokio_util::codec::FramedRead;
 
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result as IoResult};
 
 type IncomingPacketSink = mpsc::Sender<IncomingPacket>;
 type IncomingPacketReader<T> = PacketReader<FramedRead<HaltAsyncRead<T>, LengthDelimitedCodec>>;
+type IncomingPacketReaderTx<T> =
+    mpsc::UnboundedSender<(usize, StreamMover<IncomingPacketReader<T>>)>;
+type StreamMovers<T> = HashMap<
+    StreamId,
+    (
+        StreamMoverControl,
+        oneshot::Receiver<IncomingPacketReader<T>>,
+    ),
+>;
 
 pub struct PacketMultiplexer<Out, T, I: IdGen = IncrementIdGen>
 where
@@ -25,10 +31,11 @@ where
     T: Unpin,
     Out: Stream<Item = OutgoingPacket>,
 {
-    readers: Option<Vec<SelectAll<IncomingPacketReader<T>>>>,
+    readers: Option<Vec<SelectAll<StreamMover<IncomingPacketReader<T>>>>>,
     senders: MultiplexerSenders<T, I>,
     outgoing: Out,
     incoming_packet_sinks: Option<Vec<IncomingPacketSink>>,
+    stream_movers: StreamMovers<T>,
 }
 
 impl<Out, T, I> std::fmt::Debug for PacketMultiplexer<Out, T, I>
@@ -78,11 +85,14 @@ where
             .map(|_| SelectAll::new())
             .collect();
 
+        let stream_movers = StreamMovers::default();
+
         Self {
             senders,
             outgoing,
             readers: Some(readers),
             incoming_packet_sinks: Some(incoming_packet_sinks),
+            stream_movers,
         }
     }
 }
@@ -114,23 +124,29 @@ where
         let channel_count = incoming_packet_sinks.len();
         let mut incoming_packet_readers_tx = Vec::with_capacity(channel_count);
 
-        for _ in 0..channel_count {
+        for channel in 0..channel_count {
             let reader = readers.remove(0);
             let incoming_packet_sink = incoming_packet_sinks.remove(0);
 
             let (incoming_packet_reader_tx, incoming_packet_reader_rx) = mpsc::unbounded_channel();
             incoming_packet_readers_tx.push(incoming_packet_reader_tx);
 
-            Self::run_channel(reader, incoming_packet_sink, incoming_packet_reader_rx);
+            Self::run_channel(
+                channel,
+                reader,
+                incoming_packet_sink,
+                incoming_packet_reader_rx,
+            );
         }
 
+        // FIXME: Consider better names...
         let (mut incoming_packet_reader_tx, mut incoming_packet_reader_rx) =
             mpsc::unbounded_channel();
 
         tokio::task::spawn(async move {
+            // Distribute incoming PacketReaders into the different channels
             while let Some((channel, packet_reader)) = incoming_packet_reader_rx.recv().await {
-                let ipr_tx: &mpsc::UnboundedSender<IncomingPacketReader<T>> =
-                    &incoming_packet_readers_tx[channel];
+                let ipr_tx: &mpsc::UnboundedSender<_> = &incoming_packet_readers_tx[channel];
                 if let Err(err) = ipr_tx.send(packet_reader) {
                     tracing::error!(?err, "Error moving incoming stream to channel");
                 }
@@ -153,7 +169,14 @@ where
                     }
                     outgoing_opt = self.outgoing.next() => {
                         if let Some(outgoing_packet) = outgoing_opt {
-                            self.handle_outgoing_packet(outgoing_packet).await;
+                            match &outgoing_packet.message {
+                                OutgoingMessage::Bytes(bytes) => {
+                                    self.handle_outgoing_bytes(&outgoing_packet.ids, bytes).await;
+                                }
+                                OutgoingMessage::ChangeChannel(channel) => {
+                                    self.change_channel(&outgoing_packet.ids, *channel, &mut incoming_packet_reader_tx).await;
+                                }
+                            }
                         }
                     }
                     control_message_opt = control.next() => {
@@ -169,20 +192,23 @@ where
     }
 
     fn run_channel(
-        mut reader: SelectAll<IncomingPacketReader<T>>,
+        channel: usize,
+        mut reader: SelectAll<StreamMover<IncomingPacketReader<T>>>,
         mut incoming_packet_sink: IncomingPacketSink,
-        mut incoming_packet_reader_rx: mpsc::UnboundedReceiver<IncomingPacketReader<T>>,
+        mut incoming_packet_reader_rx: mpsc::UnboundedReceiver<
+            StreamMover<IncomingPacketReader<T>>,
+        >,
     ) -> tokio::task::JoinHandle<()> {
         tokio::task::spawn(async move {
             let mut incoming_packet: Option<IncomingPacket> = None;
             loop {
-                tracing::trace!(?incoming_packet, "incoming loop start");
+                tracing::trace!(channel, ?incoming_packet, "incoming loop start");
                 match incoming_packet.clone() {
                     // We do not have an incoming packet
                     None => tokio::select!(
                         // FIXME: This block is duplicated, down below
                         packet_reader = incoming_packet_reader_rx.recv() => {
-                            tracing::trace!(?packet_reader, "incoming socket (none)");
+                            tracing::trace!("incoming socket (none)");
                             match packet_reader {
                                 Some(packet_reader) => {
                                     reader.push(packet_reader);
@@ -212,7 +238,7 @@ where
                     Some(packet) => tokio::select!(
                         // FIXME: This block is duplicated, up above
                         packet_reader = incoming_packet_reader_rx.recv() => {
-                            tracing::trace!(?packet_reader, "incoming socket (some)");
+                            tracing::trace!("incoming socket (some)");
                             match packet_reader {
                                 Some(packet_reader) => {
                                     reader.push(packet_reader);
@@ -224,7 +250,7 @@ where
                             }
                         }
                         send_result = incoming_packet_sink.send(packet) => {
-                            tracing::trace!(?send_result, "sending data");
+                            tracing::trace!(channel, ?send_result, "sending data");
                             // We have to convert the option back to None
                             incoming_packet.take();
 
@@ -239,36 +265,61 @@ where
         })
     }
 
-    #[tracing::instrument(level = "trace", skip(self, packet))]
-    async fn handle_outgoing_packet(&mut self, packet: OutgoingPacket) {
-        for id in packet.ids.iter().copied() {
-            match &packet.message {
-                OutgoingMessage::Bytes(bytes) => {
-                    tracing::trace!(stream=?id, bytes=?bytes, "sending");
-                    // FIXME: What should we do if there are send errors?
-                    if let Err(error) = self.send(id, bytes.clone()).await {
-                        tracing::error!(%error, "outgoing packet");
-                    }
+    #[tracing::instrument(level = "trace", skip(self, ids, bytes))]
+    async fn handle_outgoing_bytes(&mut self, ids: &Vec<StreamId>, bytes: &Bytes) {
+        for id in ids {
+            tracing::trace!(stream=?id, bytes=?bytes, "sending");
+            // FIXME: What should we do if there are send errors?
+            if let Err(error) = self.send(*id, bytes.clone()).await {
+                tracing::error!(%error, "outgoing packet");
+            }
+        }
+    }
+
+    async fn change_channel(
+        &mut self,
+        ids: &Vec<StreamId>,
+        channel: usize,
+        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<T>,
+    ) {
+        tracing::trace!(?ids, ?channel, "change channel");
+        for id in ids {
+            // Fetch the StreamMoverController
+            match self.stream_movers.remove(&id) {
+                None => {
+                    tracing::error!(id, "was not in stream_movers");
                 }
-                OutgoingMessage::ChangeChannel(channel) => {
-                    tracing::trace!(?id, ?channel, "change channel");
-                    self.change_channel(id, *channel);
+                Some((control, receiver)) => {
+                    // Signal so that it moves the PacketReader to us
+                    control.signal();
+
+                    // wait for the oneshot to receive the PacketReader
+                    match receiver.await {
+                        Ok(packet_reader) => {
+                            self.enqueue_packet_reader(
+                                *id,
+                                channel,
+                                packet_reader,
+                                incoming_packet_reader_tx,
+                            );
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "Could not receive for channel change");
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn change_channel(&self, _id: StreamId, _channel: usize) {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(level = "trace", skip(self, stream))]
+    #[tracing::instrument(level = "trace", skip(self, stream, incoming_packet_reader_tx))]
     fn handle_incoming_connection(
         &mut self,
         stream: T,
-        incoming_packet_reader_tx: &mut mpsc::UnboundedSender<(usize, IncomingPacketReader<T>)>,
+        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<T>,
     ) {
         tracing::trace!(?stream, "new connection");
+
         // Add it to the hashmap so that we own it
         let (rx, tx): (ReadHalf<T>, WriteHalf<T>) = tokio::io::split(stream);
 
@@ -291,16 +342,33 @@ where
             .new_read(async_read_halt);
         let reader = PacketReader::new(stream_id, framed_read);
 
+        self.enqueue_packet_reader(stream_id, 0, reader, incoming_packet_reader_tx);
+    }
+
+    fn enqueue_packet_reader(
+        &mut self,
+        stream_id: StreamId,
+        channel: usize,
+        reader: IncomingPacketReader<T>,
+        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<T>,
+    ) {
         // Wrap the packet reader in a StreamMover
+        // FIXME: Duplicated in change_channel
+        let (move_stream_tx, move_stream_rx) = oneshot::channel();
+        let (control, stream_mover) = StreamMoverControl::wrap(reader, move_stream_tx);
 
-        /*
-        Stream + Holds Another Stream + Can give up it's inner stream
-        takes oneshot::receiver<()> and listenes for when to give up it's inner steam
-        takes oneshot::sender<Stream..> and sends it's inner stream when told
-        */
+        tracing::trace!(stream_id, channel, "inserting into stream_movers");
+        if self
+            .stream_movers
+            .insert(stream_id, (control, move_stream_rx))
+            .is_some()
+        {
+            tracing::error!(stream_id, "was already in the stream_movers");
+        }
 
+        tracing::trace!(stream_id, channel, "enqueueing");
         // Send the PacketReader to channel zero
-        if let Err(_) = incoming_packet_reader_tx.send((0, reader)) {
+        if let Err(_) = incoming_packet_reader_tx.send((channel, stream_mover)) {
             tracing::error!("Error enqueueing incoming connection");
         }
     }
