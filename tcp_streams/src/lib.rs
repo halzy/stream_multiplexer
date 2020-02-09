@@ -44,6 +44,12 @@ impl IncomingPacket {
     pub fn message(&self) -> &IncomingMessage {
         &self.message
     }
+    pub fn bytes(&self) -> Option<&Bytes> {
+        match &self.message {
+            IncomingMessage::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -60,6 +66,13 @@ pub struct OutgoingPacket {
 impl OutgoingPacket {
     pub fn new(ids: Vec<StreamId>, message: OutgoingMessage) -> Self {
         Self { ids, message }
+    }
+    pub fn change_channel(id: StreamId, channel_id: usize) -> Self {
+        let message = OutgoingMessage::ChangeChannel(channel_id);
+        Self {
+            ids: vec![id],
+            message,
+        }
     }
 }
 
