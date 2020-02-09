@@ -3,7 +3,7 @@
  * linkdeadsupport
  * server id
  **/
-use tcp_streams::*;
+use stream_multiplexer::*;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
