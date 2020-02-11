@@ -3,22 +3,23 @@ use crate::{IncomingMessage, IncomingPacket, StreamId};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Wraps the incoming stream data in a structure with it's stream_id
 #[derive(Copy, Clone, PartialEq, Debug)]
-pub struct PacketReader<S> {
+pub(crate) struct PacketReader<St> {
     stream_id: StreamId,
-    inner: S,
+    inner: St,
 }
-impl<S> PacketReader<S> {
-    pub fn new(stream_id: StreamId, inner: S) -> Self {
+impl<St> PacketReader<St> {
+    pub(crate) fn new(stream_id: StreamId, inner: St) -> Self {
         Self { stream_id, inner }
     }
 }
 
-impl<S> futures::stream::Stream for PacketReader<S>
+impl<St> futures::stream::Stream for PacketReader<St>
 where
-    S: futures::stream::Stream<Item = Result<bytes::BytesMut, std::io::Error>> + Unpin,
+    St: TryStream + Unpin,
 {
-    type Item = Result<IncomingPacket, std::io::Error>;
+    type Item = Result<IncomingPacket<St::Ok>, St::Error>;
 
     #[tracing::instrument(level = "trace", skip(self, ctx))]
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -30,7 +31,7 @@ where
                 tracing::trace!(?bytes, "reading");
                 Some(Ok(IncomingPacket {
                     id: self.stream_id,
-                    message: IncomingMessage::Bytes(bytes.freeze()),
+                    message: IncomingMessage::Value(bytes.freeze()),
                 }))
                 .into()
             }
@@ -193,7 +194,7 @@ mod tests {
         // Read the second packet
         let result = framed_read.next().await.unwrap().unwrap();
         match result.message {
-            IncomingMessage::Bytes(data) => {
+            IncomingMessage::Value(data) => {
                 assert_eq!(payload_size, data.len());
                 assert_eq!(Bytes::from(vec![0xFF_u8; payload_size]), data);
             }

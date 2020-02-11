@@ -14,18 +14,18 @@ struct Inner {
 }
 
 #[derive(Clone, Debug)]
-pub struct StreamMoverControl {
+pub(crate) struct StreamMoverControl {
     inner: Arc<Inner>,
 }
 
 impl StreamMoverControl {
-    pub fn signal(&self) {
+    pub(crate) fn signal(&self) {
         self.inner.set.store(true, Relaxed);
         self.inner.waker.wake();
     }
 
     #[tracing::instrument(level = "trace", skip(stream, move_channel))]
-    pub fn wrap<S>(stream: S, move_channel: oneshot::Sender<S>) -> (Self, StreamMover<S>) {
+    pub(crate) fn wrap<S>(stream: S, move_channel: oneshot::Sender<S>) -> (Self, StreamMover<S>) {
         let inner = Arc::new(Inner {
             waker: AtomicWaker::new(),
             set: AtomicBool::new(false),
@@ -44,17 +44,17 @@ impl StreamMoverControl {
 }
 
 #[derive(Debug)]
-pub struct StreamMover<S> {
+pub(crate) struct StreamMover<St> {
     inner: Arc<Inner>,
-    stream: Option<S>,
-    move_channel: Option<oneshot::Sender<S>>,
+    stream: Option<St>,
+    move_channel: Option<oneshot::Sender<St>>,
 }
-impl<S> StreamMover<S>
+impl<St> StreamMover<St>
 where
-    S: Stream,
+    St: Stream,
 {
     #[tracing::instrument(level = "trace", skip(self))]
-    fn send_stream(&mut self) -> Poll<Option<S::Item>> {
+    fn send_stream(&mut self) -> Poll<Option<St::Item>> {
         match self.stream {
             None => Poll::Ready(None),
             Some(_) => {
@@ -69,15 +69,15 @@ where
         }
     }
 }
-impl<S> Unpin for StreamMover<S> {}
-impl<S> futures::stream::Stream for StreamMover<S>
+impl<St> Unpin for StreamMover<St> {}
+impl<St> Stream for StreamMover<St>
 where
-    S: Stream + Unpin,
+    St: Stream + Unpin,
 {
-    type Item = S::Item;
+    type Item = St::Item;
 
     #[tracing::instrument(level = "trace", skip(self, cx))]
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<S::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<St::Item>> {
         // quick check to avoid registration if already done.
         if self.inner.set.load(Relaxed) {
             return self.send_stream();
@@ -106,9 +106,6 @@ mod tests {
     use super::*;
 
     use futures::stream::StreamExt;
-    use tokio::io::AsyncReadExt;
-
-    use std::io::{Cursor, ErrorKind};
 
     #[tokio::test(basic_scheduler)]
     async fn move_stream() {

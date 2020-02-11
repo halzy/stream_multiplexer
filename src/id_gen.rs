@@ -1,15 +1,23 @@
 use crate::StreamId;
 
+/// Provided to MultiplexerSenders to override the default incrementing generator
 pub trait IdGen: Default {
+    /// Produces a new Id
     fn next(&mut self) -> StreamId;
+
+    /// The current Id
     fn id(&self) -> StreamId;
+
+    /// Useful for setting a random seed, or a starting value.
     fn seed(&mut self, _seed: usize) {}
 }
 
+/// The default IdGen for MultiplexerSenders
 #[derive(Default, Copy, Clone, PartialEq, Debug)]
 pub struct IncrementIdGen {
     id: StreamId,
 }
+impl Unpin for IncrementIdGen {}
 impl IdGen for IncrementIdGen {
     /// Find the next available StreamId
     #[tracing::instrument(level = "trace", skip(self))]
