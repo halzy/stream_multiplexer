@@ -287,6 +287,8 @@ mod tests {
 
         let stream_id = stream_id_rx.await.expect("Should get stream id back.");
 
+        reader.set_stream_id(stream_id);
+
         // Send some data to the stream
         for x in 0_u8..10 {
             let message = OutgoingMessage::Value(x);
@@ -295,7 +297,15 @@ mod tests {
 
         // Send some data to the stream
         for x in 0_u8..10 {
-            assert_eq!(x, reader.next().await.expect("should have data"));
+            assert_eq!(
+                &x,
+                reader
+                    .next()
+                    .await
+                    .expect("should have data")
+                    .value()
+                    .unwrap()
+            );
         }
 
         // Send the shutdown message to the stream

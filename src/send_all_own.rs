@@ -118,7 +118,10 @@ mod tests {
         // crate::tests::init_logging();
 
         let (tx, rx) = mpsc::channel::<u8>(10);
-        let (sender, mut reader) = crate::tests::sender_reader(tx, rx);
+        let (mut sender, mut reader) = crate::tests::sender_reader(tx, rx);
+
+        sender.set_stream_id(42);
+        reader.set_stream_id(42);
 
         let (mut tx, rx) = mpsc::channel(8);
         let send_all = SendAllOwn::new(sender, rx);
@@ -130,9 +133,9 @@ mod tests {
         let (result, _send_all) = send_all.into_future().await;
         assert!(result.unwrap().is_ok());
 
-        assert_eq!(1_u8, reader.next().await.unwrap());
-        assert_eq!(2_u8, reader.next().await.unwrap());
-        assert_eq!(3_u8, reader.next().await.unwrap());
+        assert_eq!(&1_u8, reader.next().await.unwrap().value().unwrap());
+        assert_eq!(&2_u8, reader.next().await.unwrap().value().unwrap());
+        assert_eq!(&3_u8, reader.next().await.unwrap().value().unwrap());
     }
 
     #[tokio::test]
@@ -140,7 +143,10 @@ mod tests {
         //crate::tests::init_logging();
 
         let (tx, rx) = mpsc::channel::<u8>(10);
-        let (sender, mut reader) = crate::tests::sender_reader(tx, rx);
+        let (mut sender, mut reader) = crate::tests::sender_reader(tx, rx);
+
+        sender.set_stream_id(42);
+        reader.set_stream_id(42);
 
         let (mut tx, rx) = mpsc::channel(8);
         let send_all = SendAllOwn::new(sender, rx);
@@ -148,11 +154,11 @@ mod tests {
         tx.send(1_u8).await.unwrap();
         let (result, send_all) = send_all.into_future().await;
         assert!(result.unwrap().is_ok());
-        assert_eq!(1_u8, reader.next().await.unwrap());
+        assert_eq!(&1_u8, reader.next().await.unwrap().value().unwrap());
 
         tx.send(2_u8).await.unwrap();
         let (result, _send_all) = send_all.into_future().await;
         assert!(result.unwrap().is_ok());
-        assert_eq!(2_u8, reader.next().await.unwrap());
+        assert_eq!(&2_u8, reader.next().await.unwrap().value().unwrap());
     }
 }

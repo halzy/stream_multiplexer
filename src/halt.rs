@@ -1,3 +1,5 @@
+use crate::*;
+
 use futures::prelude::*;
 use futures::task::{AtomicWaker, Context, Poll};
 
@@ -39,6 +41,7 @@ impl HaltRead {
                 inner: Arc::clone(&inner),
             },
             HaltAsyncRead {
+                stream_id: None,
                 inner,
                 read: Some(read),
             },
@@ -48,6 +51,7 @@ impl HaltRead {
 
 #[derive(Debug)]
 pub(crate) struct HaltAsyncRead<St> {
+    stream_id: Option<StreamId>,
     inner: Arc<Inner>,
     read: Option<St>,
 }
@@ -56,7 +60,7 @@ where
     St: Stream,
 {
     #[tracing::instrument(level = "trace", skip(self))]
-    fn shutdown(&mut self) -> Poll<Option<St::Item>> {
+    fn shutdown(&mut self) -> Poll<Option<IncomingPacket<St::Item>>> {
         match self.read {
             None => {
                 tracing::error!("stream already shutdown");
@@ -68,6 +72,16 @@ where
 
         Poll::Ready(None)
     }
+
+    pub(crate) fn set_stream_id(&mut self, stream_id: StreamId) {
+        if let Some(old_id) = self.stream_id.replace(stream_id) {
+            panic!("Stream ID was already set to: {}", old_id);
+        }
+    }
+
+    pub(crate) fn stream_id(&self) -> StreamId {
+        self.stream_id.expect("Should have stream ID")
+    }
 }
 
 impl<St> Unpin for HaltAsyncRead<St> where St: Stream + Unpin {}
@@ -75,7 +89,7 @@ impl<St> Stream for HaltAsyncRead<St>
 where
     St: Stream + Unpin,
 {
-    type Item = St::Item;
+    type Item = IncomingPacket<St::Item>;
 
     #[tracing::instrument(level = "trace", skip(self, ctx))]
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -98,7 +112,14 @@ where
             // causes self.read to become none, and we take the other
             // branches.
             tracing::trace!("self.read.poll_read()");
-            Pin::new(&mut self.read.as_mut().unwrap()).poll_next(ctx)
+            let value = futures::ready!(Pin::new(&mut self.read.as_mut().unwrap()).poll_next(ctx));
+            match value {
+                Some(value) => {
+                    let message = IncomingMessage::Value(value);
+                    Poll::Ready(Some(IncomingPacket::new(self.stream_id(), message)))
+                }
+                None => Poll::Ready(None),
+            }
         }
     }
 }
@@ -125,13 +146,32 @@ mod tests {
 
         let (halt, mut reader) = HaltRead::wrap(framed_reader);
 
+        reader.set_stream_id(42);
+
         // Zero bytes,
-        assert_eq!(Bytes::from(vec![]), reader.next().await.unwrap().unwrap());
+        assert_eq!(
+            Bytes::from(vec![]),
+            reader
+                .next()
+                .await
+                .unwrap()
+                .value()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+        );
 
         // 1 byte, value of 2
         assert_eq!(
             Bytes::from(vec![2_u8]),
-            reader.next().await.unwrap().unwrap()
+            reader
+                .next()
+                .await
+                .unwrap()
+                .value()
+                .unwrap()
+                .as_ref()
+                .unwrap()
         );
 
         // Shut down the read stream

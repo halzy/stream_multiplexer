@@ -68,9 +68,12 @@ mod tests {
     async fn sender_id() {
         // Create a 'test' stream with Read and Write halves
         let (tx, rx) = mpsc::channel::<()>(10);
-        let (mut sender, _reader) = crate::tests::sender_reader(tx, rx);
-        sender.set_stream_id(234);
-        assert_eq!(234, sender.stream_id());
+        let (mut sender, mut reader) = crate::tests::sender_reader(tx, rx);
+
+        sender.set_stream_id(42);
+        reader.set_stream_id(42);
+
+        assert_eq!(42, sender.stream_id());
     }
 
     #[tokio::test]

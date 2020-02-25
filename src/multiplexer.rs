@@ -191,7 +191,7 @@ where
         tracing::trace!("new connection");
 
         // used to re-join the two halves so that we can shut down the reader
-        let (halt, async_read_halt) = HaltRead::wrap(read_half);
+        let (halt, mut async_read_halt) = HaltRead::wrap(read_half);
 
         // Keep track of the write_half and generate a stream_id
         let sender: Sender<OutSi> = Sender::new(write_half, halt);
@@ -201,6 +201,8 @@ where
             .send((sender, stream_id_tx))
             .expect("should be able to send");
         let stream_id = stream_id_rx.await.expect("Id should be sent back.");
+
+        async_read_halt.set_stream_id(stream_id);
 
         self.enqueue_packet_reader(stream_id, 0, async_read_halt, incoming_packet_reader_tx);
     }
@@ -257,9 +259,6 @@ where
                         tracing::trace!("incoming data");
                         match packet_res {
                             Some(packet) => {
-                                let message = IncomingMessage::Value(packet);
-                                // FIXME: 0 should be the actual stream ID
-                                let packet = IncomingPacket::new(channel, message);
                                 tracing::trace!(channel, "sending data");
                                 if let Err(_) = incoming_packet_sink.send(packet).await {
                                     tracing::error!("Shutting down receive loop");
@@ -268,6 +267,13 @@ where
                             }
                             None => {
                                 tracing::error!("incoming reader received None");
+                                let message = IncomingMessage::Linkdead;
+                                let packet = IncomingPacket::new(channel, message);
+                                tracing::trace!(channel, "sending data");
+                                if let Err(_) = incoming_packet_sink.send(packet).await {
+                                    tracing::error!("Shutting down receive loop");
+                                    return;
+                                }
                             }
                         }
                     }
