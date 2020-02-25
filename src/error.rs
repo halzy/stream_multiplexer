@@ -15,11 +15,8 @@ pub enum MultiplexerError {
 
     // #[error("Sending to full stream {0}")]
     // StreamClosed(StreamId),
+
     /// Wrapper around std::io::Error
     #[error("IoError")]
     IoError(#[from] std::io::Error),
-
-    /// Nothing to see here
-    #[error("Should never happen")]
-    UnitError,
 }

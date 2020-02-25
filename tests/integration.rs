@@ -3,6 +3,9 @@
  * linkdeadsupport
  * server id
  **/
+mod stream_producer;
+use stream_producer::*;
+
 use stream_multiplexer::*;
 
 use bytes::{Bytes, BytesMut};
@@ -181,7 +184,7 @@ async fn read_packets() {
 
         // read multiplexed data
         let incoming_packet = in_data_rx.recv().await.unwrap();
-        assert_eq!(incoming_packet.id(), 0);
+        assert_eq!(incoming_packet.id(), client1_id);
         assert_eq!(
             incoming_packet
                 .value()
@@ -233,7 +236,7 @@ async fn change_channel() {
 
     // read multiplexed data from channel 0
     let incoming_packet = in_data_rx0.recv().await.unwrap();
-    assert_eq!(incoming_packet.id(), 0);
+    assert_eq!(incoming_packet.id(), client1_id);
     assert_eq!(
         incoming_packet
             .value()
@@ -267,7 +270,7 @@ async fn change_channel() {
 
     // read multiplexed data from channel 1
     let incoming_packet = in_data_rx1.recv().await.unwrap();
-    assert_eq!(incoming_packet.id(), 1);
+    assert_eq!(incoming_packet.id(), client1_id);
     assert_eq!(
         incoming_packet
             .value()
@@ -284,7 +287,6 @@ async fn change_channel() {
     assert!(shutdown_status.await.is_ok());
 }
 
-/* FIXME: PLEASE!
 #[tokio::test(basic_scheduler)]
 async fn linkdead() {
     //init_logging();
@@ -292,17 +294,30 @@ async fn linkdead() {
     let local_addr = socket.local_addr().unwrap();
     let socket = TcpStreamProducer::new(socket);
 
+    // so that we can signal shutdown
     let (control_write, control_read) = channel::unbounded_channel();
     let (_data_write, data_read) = channel::unbounded_channel();
-    let (in_data_tx, _in_data_rx) = channel::channel(10);
-    let tcp_streams = Multiplexer::new(8, data_read, vec![in_data_tx]);
 
-    let shutdown_status = tcp_streams.run(socket, control_read);
+    // sharing the idgen so that we can get the client stream_ids
+    let id_gen: SharedIdGen<IncrementIdGen> = SharedIdGen::default();
+    let (in_data_tx, mut in_data_rx) = channel::channel(10);
+    let multiplexer = Multiplexer::with_id_gen(8, id_gen.clone(), data_read, vec![in_data_tx]);
 
-    let client = tokio::net::TcpStream::connect(local_addr).await.unwrap();
-    client.shutdown(std::net::Shutdown::Both).unwrap();
+    // start the loop
+    let shutdown_status = tokio::task::spawn(multiplexer.run(socket, control_read));
 
+    // connect some clients so that we can send a message to them
+    let client1 = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+    let client1_id = id_gen.wait_for_next_id().await;
+    assert_eq!(1, client1_id);
+
+    // cleanup
+    client1.shutdown(std::net::Shutdown::Both).unwrap();
+
+    dbg!(in_data_rx.recv().await);
+
+    // Stop multiplexer
     control_write.send(ControlMessage::Shutdown).unwrap();
-    assert!(shutdown_status.await.await.is_ok());
+
+    assert!(shutdown_status.await.is_ok());
 }
-*/
