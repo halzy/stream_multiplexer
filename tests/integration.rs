@@ -52,7 +52,17 @@ impl<T: IdGen> SharedIdGen<T> {
     }
 }
 
-pub async fn bind() -> IoResult<TcpListener> {
+#[allow(dead_code)]
+pub(crate) fn init_logging() {
+    use tracing_subscriber::FmtSubscriber;
+
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+}
+
+async fn bind() -> IoResult<TcpListener> {
     tracing::info!("Starting");
     let addrs = "127.0.0.1:0".to_string();
     tracing::info!("Binding {:?}", &addrs);
@@ -61,12 +71,12 @@ pub async fn bind() -> IoResult<TcpListener> {
 
 #[tokio::test(basic_scheduler)]
 async fn shutdown() {
-    let socket = TcpStreamProducer::new(bind().await.unwrap());
+    let stream_halves = TcpStreamProducer::new(bind().await.unwrap());
     let (control_write, control_read) = channel::unbounded_channel();
     let (_data_write, data_read) = channel::unbounded_channel();
     let (in_data_tx, _in_data_rx) = channel::channel(10);
-    let tcp_streams = PacketMultiplexer::new(data_read, vec![in_data_tx]);
-    let shutdown_status = tokio::task::spawn(tcp_streams.run(socket, control_read));
+    let multiplexer = Multiplexer::new(8, data_read, vec![in_data_tx]);
+    let shutdown_status = tokio::task::spawn(multiplexer.run(stream_halves, control_read));
 
     control_write.send(ControlMessage::Shutdown).unwrap();
     assert!(shutdown_status.await.is_ok());
@@ -84,26 +94,17 @@ async fn socket_shutdown() {
     let (control_write, control_read) = channel::unbounded_channel();
     let (_data_write, data_read) = channel::unbounded_channel();
     let (in_data_tx, _in_data_rx) = channel::channel(10);
-    let tcp_streams = PacketMultiplexer::new(data_read, vec![in_data_tx]);
+    let tcp_streams = Multiplexer::new(8, data_read, vec![in_data_tx]);
     let shutdown_status = tokio::task::spawn(tcp_streams.run(socket, control_read));
 
     control_write.send(ControlMessage::Shutdown).unwrap();
     assert!(shutdown_status.await.is_ok());
 }
 
-#[allow(dead_code)]
-fn init_logging() {
-    use tracing_subscriber::FmtSubscriber;
-
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-}
-
 #[tokio::test(basic_scheduler)]
 async fn write_packets() {
-    // init_logging();
+    //init_logging();
+
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
     let socket = TcpStreamProducer::new(socket);
@@ -114,9 +115,9 @@ async fn write_packets() {
 
     // sharing the idgen so that we can get the client stream_ids
     let id_gen: SharedIdGen<IncrementIdGen> = SharedIdGen::default();
-    let senders = MultiplexerSenders::new(id_gen.clone());
+
     let (in_data_tx, _in_data_rx) = channel::channel(10);
-    let multiplexer = PacketMultiplexer::with_senders(senders, data_read, vec![in_data_tx]);
+    let multiplexer = Multiplexer::with_id_gen(8, id_gen.clone(), data_read, vec![in_data_tx]);
 
     // start the loop
     let shutdown_status = tokio::task::spawn(multiplexer.run(socket, control_read));
@@ -133,7 +134,7 @@ async fn write_packets() {
     data_write
         .send(OutgoingPacket::new(
             vec![client1_id],
-            OutgoingMessage::Bytes(data.clone()),
+            OutgoingMessage::Value(data.clone()),
         ))
         .unwrap();
 
@@ -162,9 +163,8 @@ async fn read_packets() {
 
     // sharing the idgen so that we can get the client stream_ids
     let id_gen: SharedIdGen<IncrementIdGen> = SharedIdGen::default();
-    let senders = MultiplexerSenders::new(id_gen.clone());
     let (in_data_tx, mut in_data_rx) = channel::channel(10);
-    let multiplexer = PacketMultiplexer::with_senders(senders, data_read, vec![in_data_tx]);
+    let multiplexer = Multiplexer::with_id_gen(8, id_gen.clone(), data_read, vec![in_data_tx]);
 
     // start the loop
     let shutdown_status = tokio::task::spawn(multiplexer.run(socket, control_read));
@@ -172,6 +172,7 @@ async fn read_packets() {
     // connect some clients so that we can send a message to them
     let mut client1 = tokio::net::TcpStream::connect(local_addr).await.unwrap();
     let client1_id = id_gen.wait_for_next_id().await;
+    assert_eq!(1, client1_id);
 
     for _ in 0_u8..2 {
         // send a message
@@ -180,10 +181,14 @@ async fn read_packets() {
 
         // read multiplexed data
         let incoming_packet = in_data_rx.recv().await.unwrap();
-        assert_eq!(incoming_packet.id(), client1_id);
+        assert_eq!(incoming_packet.id(), 0);
         assert_eq!(
-            incoming_packet.message(),
-            &IncomingMessage::Bytes(Bytes::from("a message"))
+            incoming_packet
+                .value()
+                .expect("should have a value")
+                .as_ref()
+                .unwrap(),
+            &Bytes::from("a message")
         );
     }
 
@@ -196,7 +201,7 @@ async fn read_packets() {
 
 #[tokio::test(basic_scheduler)]
 async fn change_channel() {
-    init_logging();
+    // init_logging();
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
     let socket = TcpStreamProducer::new(socket);
@@ -208,11 +213,10 @@ async fn change_channel() {
     // sharing the idgen so that we can get the client stream_ids
     let mut id_gen: SharedIdGen<IncrementIdGen> = SharedIdGen::default();
     id_gen.seed(100);
-    let senders = MultiplexerSenders::new(id_gen.clone());
     let (in_data_tx0, mut in_data_rx0) = channel::channel(10);
     let (in_data_tx1, mut in_data_rx1) = channel::channel(10);
     let multiplexer =
-        PacketMultiplexer::with_senders(senders, data_read, vec![in_data_tx0, in_data_tx1]);
+        Multiplexer::with_id_gen(8, id_gen.clone(), data_read, vec![in_data_tx0, in_data_tx1]);
 
     // start the loop
     let shutdown_status = tokio::task::spawn(multiplexer.run(socket, control_read));
@@ -221,28 +225,34 @@ async fn change_channel() {
     let mut client1 = tokio::net::TcpStream::connect(local_addr).await.unwrap();
     let client1_id = id_gen.wait_for_next_id().await;
 
+    assert_eq!(client1_id, 101);
+
     // send a message on channel 0
     let mut data = Bytes::from("\0\ta message");
     client1.write_buf(&mut data).await.unwrap();
 
     // read multiplexed data from channel 0
     let incoming_packet = in_data_rx0.recv().await.unwrap();
-    assert_eq!(incoming_packet.id(), client1_id);
+    assert_eq!(incoming_packet.id(), 0);
     assert_eq!(
-        incoming_packet.message(),
-        &IncomingMessage::Bytes(Bytes::from("a message"))
+        incoming_packet
+            .value()
+            .expect("should have a value")
+            .as_ref()
+            .unwrap(),
+        &Bytes::from("a message")
     );
 
     // Switch client1 from channel 0 to channel 1
     let change_channel = OutgoingPacket::new(vec![client1_id], OutgoingMessage::ChangeChannel(1));
-    data_write.send(change_channel);
+    data_write.send(change_channel).unwrap();
 
     // send a message to the client (so that the client waits and we can change channels)
     let data = Bytes::from("a message from the server");
     data_write
         .send(OutgoingPacket::new(
             vec![client1_id],
-            OutgoingMessage::Bytes(data.clone()),
+            OutgoingMessage::Value(data.clone()),
         ))
         .unwrap();
 
@@ -257,10 +267,14 @@ async fn change_channel() {
 
     // read multiplexed data from channel 1
     let incoming_packet = in_data_rx1.recv().await.unwrap();
-    assert_eq!(incoming_packet.id(), client1_id);
+    assert_eq!(incoming_packet.id(), 1);
     assert_eq!(
-        incoming_packet.message(),
-        &IncomingMessage::Bytes(Bytes::from("a second message"))
+        incoming_packet
+            .value()
+            .expect("Should have a value")
+            .as_ref()
+            .unwrap(),
+        &Bytes::from("a second message")
     );
 
     // cleanup
@@ -281,7 +295,7 @@ async fn linkdead() {
     let (control_write, control_read) = channel::unbounded_channel();
     let (_data_write, data_read) = channel::unbounded_channel();
     let (in_data_tx, _in_data_rx) = channel::channel(10);
-    let tcp_streams = PacketMultiplexer::new(data_read, vec![in_data_tx]);
+    let tcp_streams = Multiplexer::new(8, data_read, vec![in_data_tx]);
 
     let shutdown_status = tcp_streams.run(socket, control_read);
 

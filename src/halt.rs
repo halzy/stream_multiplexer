@@ -1,27 +1,10 @@
+use futures::prelude::*;
 use futures::task::{AtomicWaker, Context, Poll};
-use tokio::io::{
-    AsyncRead, AsyncWrite, Error as TioError, ErrorKind as TioErrorKind, ReadHalf,
-    Result as TioResult, WriteHalf,
-};
-use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 
-use std::net::Shutdown;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-
-pub trait StreamShutdown {
-    fn shutdown(&self) -> TioResult<()>;
-}
-
-impl StreamShutdown for TcpStream {
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn shutdown(&self) -> TioResult<()> {
-        self.shutdown(Shutdown::Read)
-    }
-}
 
 #[derive(Debug)]
 struct Inner {
@@ -37,17 +20,15 @@ pub struct HaltRead {
 impl HaltRead {
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn signal(&self) {
+        tracing::trace!("setting atomic bool, triggering waker");
         self.inner.set.store(true, Relaxed);
         self.inner.waker.wake();
     }
 
-    #[tracing::instrument(level = "trace", skip(read, writer))]
-    pub fn wrap<T>(
-        read: ReadHalf<T>,
-        writer: oneshot::Receiver<WriteHalf<T>>,
-    ) -> (Self, HaltAsyncRead<T>)
+    #[tracing::instrument(level = "trace", skip(read))]
+    pub fn wrap<St>(read: St) -> (Self, HaltAsyncRead<St>)
     where
-        T: AsyncRead + AsyncWrite,
+        St: Stream,
     {
         let inner = Arc::new(Inner {
             waker: AtomicWaker::new(),
@@ -60,83 +41,64 @@ impl HaltRead {
             HaltAsyncRead {
                 inner,
                 read: Some(read),
-                writer,
             },
         )
     }
 }
 
 #[derive(Debug)]
-pub struct HaltAsyncRead<T> {
+pub struct HaltAsyncRead<St> {
     inner: Arc<Inner>,
-    read: Option<ReadHalf<T>>,
-    writer: oneshot::Receiver<WriteHalf<T>>,
+    read: Option<St>,
 }
-impl<T> HaltAsyncRead<T>
+impl<St> HaltAsyncRead<St>
 where
-    T: StreamShutdown,
+    St: Stream,
 {
     #[tracing::instrument(level = "trace", skip(self))]
-    fn shutdown(&mut self) -> Poll<TioResult<usize>> {
-        use tokio::sync::oneshot::error::TryRecvError;
-
+    fn shutdown(&mut self) -> Poll<Option<St::Item>> {
         match self.read {
-            None => Poll::Ready(Err(TioError::new(
-                TioErrorKind::Other,
-                "Double shutdown on stream.",
-            ))),
+            None => {
+                tracing::error!("stream already shutdown");
+            }
             Some(_) => {
-                // _ = reader, it's taken below
-                match self.writer.try_recv() {
-                    Err(TryRecvError::Empty) => {
-                        // Return pending if we do not yet have the write half
-                        Poll::Pending
-                    }
-                    Err(TryRecvError::Closed) => {
-                        // Because we take() the reader below and guard against none above.
-                        unreachable!()
-                    }
-                    Ok(writer) => {
-                        let reader = self
-                            .read
-                            .take()
-                            .expect("Reader should still exist, was checked above");
-                        let stream = reader.unsplit(writer);
-                        stream.shutdown()?;
-                        Poll::Ready(Ok(0)) // returning 0 will signal EOF and close the connection.
-                    }
-                }
+                let _ = self.read.take();
             }
         }
+
+        Poll::Ready(None)
     }
 }
-impl<T> Unpin for HaltAsyncRead<T> {}
-impl<T> AsyncRead for HaltAsyncRead<T>
+
+impl<St> Unpin for HaltAsyncRead<St> where St: Stream + Unpin {}
+impl<St> Stream for HaltAsyncRead<St>
 where
-    T: StreamShutdown + AsyncRead + AsyncWrite,
+    St: Stream + Unpin,
 {
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<TioResult<usize>> {
+    type Item = St::Item;
+
+    #[tracing::instrument(level = "trace", skip(self, ctx))]
+    fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
         // quick check to avoid registration if already done.
         if self.inner.set.load(Relaxed) {
+            tracing::trace!("pre-waker shutdown");
             return self.shutdown();
         }
 
-        self.inner.waker.register(cx.waker());
+        tracing::trace!("waker registration");
+        self.inner.waker.register(ctx.waker());
 
         // Need to check condition **after** `register` to avoid a race
         // condition that would result in lost notifications.
         if self.inner.set.load(Relaxed) {
+            tracing::trace!("shutting down");
             self.shutdown()
         } else {
             // is only ever Some() here because inner.set being true
             // causes self.read to become none, and we take the other
             // branches.
-            Pin::new(&mut self.read.as_mut().unwrap()).poll_read(cx, buf)
+            tracing::trace!("self.read.poll_read()");
+            Pin::new(&mut self.read.as_mut().unwrap()).poll_next(ctx)
         }
     }
 }
@@ -145,50 +107,46 @@ where
 mod tests {
     use super::*;
 
-    use tokio::io::AsyncReadExt as _;
-    use tokio::io::ErrorKind;
-
-    use futures::future::FutureExt;
+    use bytes::Bytes;
+    use tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
     use std::io::Cursor;
 
-    impl StreamShutdown for Cursor<Vec<u8>> {
-        fn shutdown(&self) -> TioResult<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test(basic_scheduler)]
     async fn halt() {
+        //crate::tests::init_logging();
+
         // Stream of u8, from 0 to 15
         let cursor: Cursor<Vec<u8>> = Cursor::new((0..16).into_iter().collect());
-        let (reader, writer) = tokio::io::split(cursor);
+        let (reader, _writer) = tokio::io::split(cursor);
+        let framed_reader = LengthDelimitedCodec::builder()
+            .length_field_length(1)
+            .new_read(reader);
 
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let (halt, mut reader) = HaltRead::wrap(reader, stop_rx);
+        let (halt, mut reader) = HaltRead::wrap(framed_reader);
 
-        assert_eq!(0_u8, reader.read_u8().await.unwrap());
-        assert_eq!(1_u8, reader.read_u8().await.unwrap());
+        // Zero bytes,
+        assert_eq!(Bytes::from(vec![]), reader.next().await.unwrap().unwrap());
 
-        // Shut down the read stream
-        halt.signal();
-
-        // Check that we can't read while waitng for the writer
-        assert!(reader.read_u8().now_or_never().is_none());
-
-        // Send the writer to finish the shutdown
-        stop_tx.send(writer).unwrap();
-
-        // check that reading has stopped
+        // 1 byte, value of 2
         assert_eq!(
-            reader.read_u8().await.unwrap_err().kind(),
-            ErrorKind::UnexpectedEof
+            Bytes::from(vec![2_u8]),
+            reader.next().await.unwrap().unwrap()
         );
 
         // Shut down the read stream
         halt.signal();
 
+        // Check that we can't read while waitng for the writer
+        assert!(reader.next().await.is_none());
+
+        // check that reading has stopped
+        assert!(reader.next().await.is_none());
+
+        // Shut down the read stream
+        halt.signal();
+
         // Ensure the double shutdown error is returned
-        assert_eq!(reader.read_u8().await.unwrap_err().kind(), ErrorKind::Other);
+        assert!(reader.next().await.is_none());
     }
 }

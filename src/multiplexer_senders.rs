@@ -1,65 +1,318 @@
-use super::{IdGen, IncrementIdGen, Sender, StreamId};
+use crate::*;
 
+use futures::prelude::*;
+use futures::stream::{FuturesUnordered, StreamFuture};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
+
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-type MultiplexerSender<T> = Sender<T, LengthDelimitedCodec>;
+type SenderMessageStream<Item> = mpsc::Receiver<Item>;
 
-/// Stores MultiplexerSender and provides a generated ID
-pub struct MultiplexerSenders<T, I: IdGen = IncrementIdGen> {
-    id_gen: I,
-    senders: HashMap<StreamId, MultiplexerSender<T>>,
+type SendAll<Si, Item> = SendAllOwn<Si, SenderMessageStream<Item>>;
+
+struct SenderPair<Si, Item> {
+    sender: mpsc::Sender<Item>,
+    send_all: Option<SendAll<Si, Item>>,
 }
-impl<T, I> MultiplexerSenders<T, I>
+impl<Si, Item> SenderPair<Si, Item> {
+    fn new(sender: mpsc::Sender<Item>, send_all: SendAll<Si, Item>) -> Self {
+        Self {
+            sender,
+            send_all: send_all.into(),
+        }
+    }
+
+    fn give(&mut self, value: SendAll<Si, Item>) {
+        debug_assert!(
+            self.send_all.is_none(),
+            "SenderPair already had an item, can't hold that much!"
+        );
+        self.send_all.replace(value);
+    }
+
+    fn take(&mut self) -> Option<SendAll<Si, Item>> {
+        self.send_all.take()
+    }
+
+    fn try_send(&mut self, message: Item) -> Result<(), TrySendError<Item>> {
+        self.sender.try_send(message)
+    }
+}
+
+/// Stores Sender and provides a generated ID
+pub struct MultiplexerSenders<Item, Si, Id> {
+    sender_buffer_size: usize,
+    id_gen: Id,
+
+    // Sender ownership bounces between these two, depending on if it has outgoing data
+    senders_stream: FuturesUnordered<StreamFuture<SendAll<Si, Item>>>,
+    sender_pairs: HashMap<StreamId, SenderPair<Si, Item>>,
+
+    // Channels that provide new senders and messages
+    senders_channel: mpsc::UnboundedReceiver<(Sender<Si>, oneshot::Sender<StreamId>)>,
+    messages_channel: mpsc::UnboundedReceiver<(StreamId, OutgoingMessage<Item>)>,
+}
+
+impl<Item, Si, Id> MultiplexerSenders<Item, Si, Id>
 where
-    T: std::fmt::Debug,
-    I: IdGen,
+    Si: Sink<Item> + Unpin,
 {
-    pub fn get_mut(&mut self, stream_id: StreamId) -> Option<&mut MultiplexerSender<T>> {
-        self.senders.get_mut(&stream_id)
+    pub fn new(
+        sender_buffer_size: usize,
+        id_gen: Id,
+        senders_channel: mpsc::UnboundedReceiver<(Sender<Si>, oneshot::Sender<StreamId>)>,
+        messages_channel: mpsc::UnboundedReceiver<(StreamId, OutgoingMessage<Item>)>,
+    ) -> Self {
+        Self {
+            sender_buffer_size,
+            id_gen,
+            senders_stream: FuturesUnordered::new(),
+            sender_pairs: HashMap::new(),
+            senders_channel,
+            messages_channel,
+        }
     }
+}
 
-    pub fn get(&mut self, stream_id: StreamId) -> Option<&MultiplexerSender<T>> {
-        self.senders.get(&stream_id)
+impl<Item, Si, Id> std::fmt::Debug for MultiplexerSenders<Item, Si, Id> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiplexerSenders").finish()
     }
+}
 
-    #[tracing::instrument(level = "trace", skip(stream_id))]
-    pub fn remove(&mut self, stream_id: &StreamId) -> Option<MultiplexerSender<T>> {
-        tracing::trace!(%stream_id, "removing");
-        self.senders.remove(stream_id)
-    }
-
-    #[tracing::instrument(level = "trace", skip(sender))]
-    pub fn insert(&mut self, sender: MultiplexerSender<T>) -> StreamId {
+impl<Item, Si, Id> MultiplexerSenders<Item, Si, Id>
+where
+    Si: Sink<Item> + Unpin,
+    Si::Error: std::fmt::Debug,
+    Id: IdGen,
+{
+    #[tracing::instrument(level = "trace", skip(self, sender, stream_id_channel))]
+    fn add(&mut self, mut sender: Sender<Si>, stream_id_channel: oneshot::Sender<StreamId>) {
         loop {
             let id = self.id_gen.next();
 
-            if !self.senders.contains_key(&id) {
-                tracing::trace!(stream_id=%id, "inserting");
-                let res = self.senders.insert(id, sender);
+            if !self.sender_pairs.contains_key(&id) {
+                tracing::trace!(stream_id = id, "inserting");
+
+                sender.set_stream_id(id);
+
+                let (tx, rx) = mpsc::channel(self.sender_buffer_size);
+                let sender_stream = SendAllOwn::new(sender, rx);
+
+                let sender_pair = SenderPair::new(tx, sender_stream);
+
+                let res = self.sender_pairs.insert(id, sender_pair);
                 assert!(res.is_none(), "MPSender: Highly unlikely");
-                break id;
+
+                if let Err(_) = stream_id_channel.send(id) {
+                    tracing::error!("could not return stream_id for new sender");
+                }
+
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_lengths(&self) -> (usize, usize) {
+        let futures_len = self.senders_stream.len();
+        let sender_pairs_len = self.sender_pairs.len();
+        (futures_len, sender_pairs_len)
+    }
+
+    fn handle_new_message(&mut self, (stream_id, message): (StreamId, OutgoingMessage<Item>)) {
+        match message {
+            OutgoingMessage::ChangeChannel(_) => {
+                unreachable!("Message should have been consumed by Multiplexer");
+            }
+            OutgoingMessage::Shutdown => match self.sender_pairs.remove(&stream_id) {
+                Some(_) => {
+                    // The Sender could still be in the FuturesUnordered, it should not be
+                    // re-inserted into the sender_pairs hashmap.
+                    tracing::trace!(stream_id, "Shutting down stream sender.");
+                }
+                None => {
+                    tracing::warn!(stream_id, "Trying to shut down non-existent sender.");
+                }
+            },
+            OutgoingMessage::Value(value) => {
+                match self.sender_pairs.entry(stream_id) {
+                    Entry::Vacant(_) => {
+                        tracing::warn!(stream_id, "Tring to send message to non-existent stream.");
+                    }
+                    Entry::Occupied(mut sender_pair_entry) => {
+                        let sender_pair = sender_pair_entry.get_mut();
+                        match sender_pair.try_send(value) {
+                            Ok(()) => {
+                                // Enqueue the message and move the sender into the FuturesUnordered
+                                tracing::trace!(stream_id, "Enqueued message.");
+                                if let Some(sender) = sender_pair.take() {
+                                    self.senders_stream.push(sender.into_future());
+                                }
+                            }
+                            Err(TrySendError::Full(_)) => {
+                                tracing::error!(stream_id, "Stream is full, shutting down sender.");
+                                sender_pair_entry.remove_entry();
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                tracing::error!(
+                                    stream_id,
+                                    "Stream is closed, shutting down sender."
+                                );
+                                sender_pair_entry.remove_entry();
+                            }
+                        }
+                    }
+                };
+            }
+        }
+    }
+
+    fn handle_finished_sink(
+        &mut self,
+        opt_res: (
+            Option<Result<(), Si::Error>>,
+            SendAllOwn<Si, SenderMessageStream<Item>>,
+        ),
+    ) {
+        match opt_res {
+            // Sender finished sending, put it back in the hashmap
+            (Some(Ok(())), sender) => {
+                tracing::trace!("senders produced Some(Ok(())");
+                let stream_id = sender.inner().stream_id();
+                match self.sender_pairs.entry(stream_id) {
+                    Entry::Vacant(_) => {
+                        // It could have been shut-down while sending packets.
+                        tracing::warn!(stream_id, "No sender_pairs entry, dropping");
+                    }
+                    Entry::Occupied(mut sender_pair_entry) => {
+                        sender_pair_entry.get_mut().give(sender);
+                    }
+                }
+            }
+            (Some(Err(err)), _sender) => {
+                tracing::error!(?err, "senders produced an error");
+                todo!();
+            }
+            (None, _sender) => todo!(),
+        }
+    }
+
+    pub(crate) async fn run_to_completion(&mut self) {
+        tracing::trace!("get_next() starting");
+
+        loop {
+            tracing::trace!("loop");
+            tokio::select! {
+                new_sender = self.senders_channel.next() => {
+                    match new_sender {
+                        None => {
+                            tracing::trace!("senders_channel() had None, returning");
+                            return;
+                        }
+                        Some((sender, return_channel))  => {
+                            tracing::trace!("senders_channel");
+                            self.add(sender, return_channel);
+                        }
+                    }
+                }
+                new_message = self.messages_channel.next() => {
+                    match new_message {
+                        None => {
+                            tracing::trace!("message_channel() had None, returning");
+                            return;
+                        }
+                        Some(message) => {
+                            tracing::trace!("messages_channel");
+                            self.handle_new_message(message);
+                        }
+                    }
+                }
+                // Polling to pump the outgoing message futures
+                Some(senders_opt) = self.senders_stream.next(), if !self.senders_stream.is_empty() => {
+                    tracing::trace!("senders_stream");
+                    self.handle_finished_sink(senders_opt);
+                },
+                else => {
+                    tracing::trace!("get_next() exiting with None");
+                    return;
+                }
             }
         }
     }
 }
-impl<T, I> MultiplexerSenders<T, I>
-where
-    I: IdGen,
-{
-    pub fn new(id_gen: I) -> Self {
-        Self {
-            id_gen,
-            senders: HashMap::new(),
-        }
-    }
-}
 
-impl<T, I> std::fmt::Debug for MultiplexerSenders<T, I>
-where
-    I: IdGen,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MultiplexerSenders").finish()
+// FIXME: TODO:
+//  - Figure out how to remove closed senders (and send_tx) from the hashmaps
+//  - Check to see if the sender should be re-inserted when they come out of the FuturesUnordered
+//  - If the reader is closed, what do we do?
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use futures::channel::mpsc as fut_mpsc;
+
+    #[tokio::test(basic_scheduler)]
+    async fn send_message_and_shutdown() {
+        // crate::tests::init_logging();
+
+        // Set up a teest incrementer
+        let id_gen = IncrementIdGen::default();
+
+        // Set up channels for new connections & messages
+        let (sender_channel, sender_channel_rx) = mpsc::unbounded_channel();
+        let (message_channel, message_channel_rx) = mpsc::unbounded_channel();
+
+        // The struct we're testing
+        let mut multiplexer_senders =
+            MultiplexerSenders::new(32, id_gen, sender_channel_rx, message_channel_rx);
+
+        let ms_join = tokio::task::spawn(async move {
+            multiplexer_senders.run_to_completion().await;
+            multiplexer_senders
+        });
+
+        // Create Sender & Reader test pair
+        let (tx, rx) = fut_mpsc::channel::<u8>(10);
+        let (sender, mut reader) = crate::tests::sender_reader(tx.clone(), rx);
+
+        // Return channel for the new stream id
+        let (stream_id_tx, stream_id_rx) = oneshot::channel();
+
+        // Give the new sender to multiplexer_senders
+        sender_channel
+            .send((sender, stream_id_tx))
+            .expect("should be able to send");
+
+        let stream_id = stream_id_rx.await.expect("Should get stream id back.");
+
+        // Send some data to the stream
+        for x in 0_u8..10 {
+            let message = OutgoingMessage::Value(x);
+            message_channel.send((stream_id, message)).unwrap();
+        }
+
+        // Send some data to the stream
+        for x in 0_u8..10 {
+            assert_eq!(x, reader.next().await.expect("should have data"));
+        }
+
+        // Send the shutdown message to the stream
+        let message = OutgoingMessage::Shutdown;
+        message_channel.send((stream_id, message)).unwrap();
+
+        // Await the reader so that it shuts down
+        reader.next().await;
+
+        // Drop these channels to shut down multixplexer_senders
+        drop(sender_channel);
+        drop(message_channel);
+
+        // Should no longer have futures or senders
+        let multiplexer_senders = ms_join.await.unwrap();
+        assert_eq!((0, 0), multiplexer_senders.test_lengths());
     }
 }
