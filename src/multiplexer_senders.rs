@@ -42,7 +42,7 @@ impl<Si, Item> SenderPair<Si, Item> {
 }
 
 /// Stores Sender and provides a generated ID
-pub struct MultiplexerSenders<Item, Si, Id> {
+pub(crate) struct MultiplexerSenders<Item, Si, Id> {
     sender_buffer_size: usize,
     id_gen: Id,
 
@@ -59,7 +59,7 @@ impl<Item, Si, Id> MultiplexerSenders<Item, Si, Id>
 where
     Si: Sink<Item> + Unpin,
 {
-    pub fn new(
+    pub(crate) fn new(
         sender_buffer_size: usize,
         id_gen: Id,
         senders_channel: mpsc::UnboundedReceiver<(Sender<Si>, oneshot::Sender<StreamId>)>,
@@ -85,7 +85,6 @@ impl<Item, Si, Id> std::fmt::Debug for MultiplexerSenders<Item, Si, Id> {
 impl<Item, Si, Id> MultiplexerSenders<Item, Si, Id>
 where
     Si: Sink<Item> + Unpin,
-    Si::Error: std::fmt::Debug,
     Id: IdGen,
 {
     #[tracing::instrument(level = "trace", skip(self, sender, stream_id_channel))]
@@ -116,7 +115,7 @@ where
     }
 
     #[cfg(test)]
-    pub fn test_lengths(&self) -> (usize, usize) {
+    pub(crate) fn test_lengths(&self) -> (usize, usize) {
         let futures_len = self.senders_stream.len();
         let sender_pairs_len = self.sender_pairs.len();
         (futures_len, sender_pairs_len)
@@ -192,8 +191,8 @@ where
                     }
                 }
             }
-            (Some(Err(err)), _sender) => {
-                tracing::error!(?err, "senders produced an error");
+            (Some(Err(_err)), _sender) => {
+                tracing::error!("senders produced an error");
                 todo!();
             }
             (None, _sender) => todo!(),
@@ -245,7 +244,6 @@ where
 }
 
 // FIXME: TODO:
-//  - Figure out how to remove closed senders (and send_tx) from the hashmaps
 //  - Check to see if the sender should be re-inserted when they come out of the FuturesUnordered
 //  - If the reader is closed, what do we do?
 

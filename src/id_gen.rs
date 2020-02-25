@@ -12,7 +12,8 @@ pub trait IdGen: Default {
     fn seed(&mut self, _seed: usize) {}
 }
 
-/// The default IdGen for MultiplexerSenders
+/// Generates IDs for incoming streams. Is the default `IdGen` for `MultiplexerSenders`.
+/// This implementation simply increments and wraps at the usize boundary.
 #[derive(Default, Copy, Clone, PartialEq, Debug)]
 pub struct IncrementIdGen {
     id: StreamId,

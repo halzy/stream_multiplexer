@@ -3,6 +3,9 @@
  * linkdeadsupport
  * server id
  **/
+mod stream_producer;
+use stream_producer::*;
+
 use stream_multiplexer::*;
 
 use bytes::{Bytes, BytesMut};

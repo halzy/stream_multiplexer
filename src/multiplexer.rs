@@ -20,6 +20,9 @@ type StreamMovers<InSt> = HashMap<
 >;
 
 /// Manages incoming streams of data and the enqueueing of outgoing data.
+///
+/// Outgoing streams have their own buffer of messages and do not affect other streams.
+/// Incoming streams have their messages routed into channels that have their own backpressure.
 pub struct Multiplexer<InSt, Out, OutItem, OutSi, Id>
 where
     InSt: Stream,
@@ -48,9 +51,7 @@ where
     OutSi: Sink<OutItem> + Unpin,
 {
     // FIXME: Consider taking a function that can determine which channel a packet should be in
-    /// Initializes with a stream that provides the outgoing packets which will be enqueued to the
-    /// corresponding streams, and a vector of sinks that represent different "channels" or
-    /// "categories" of data.
+    /// Calls `with_id_gen`, giving it an IncrementIdGen as well as the rest of the arguments.
     pub fn new(
         sender_buffer_size: usize,
         outgoing: Out,
@@ -67,8 +68,9 @@ where
     InSt: Stream + Unpin,
     OutSi: Sink<OutItem> + Unpin,
 {
-    /// like `run` and gives the ability to overrid MultiplexerSenders, which is useful when
-    /// overridding the default IdGen in MultiplexerSenders for testing.
+    /// Initializes with a stream that provides the outgoing packets which will be enqueued to the
+    /// corresponding streams, and a vector of sinks that represent different "channels" or
+    /// "categories" of data.
     pub fn with_id_gen(
         sender_buffer_size: usize,
         id_gen: Id,
@@ -178,21 +180,21 @@ where
 
     #[tracing::instrument(
         level = "trace",
-        skip(self, framed_write_half, framed_read_half, incoming_packet_reader_tx)
+        skip(self, write_half, read_half, incoming_packet_reader_tx)
     )]
     async fn handle_incoming_connection(
         &mut self,
-        framed_write_half: OutSi,
-        framed_read_half: InSt,
+        write_half: OutSi,
+        read_half: InSt,
         incoming_packet_reader_tx: &mut IncomingPacketReaderTx<InSt>,
     ) {
         tracing::trace!("new connection");
 
         // used to re-join the two halves so that we can shut down the reader
-        let (halt, async_read_halt) = HaltRead::wrap(framed_read_half);
+        let (halt, async_read_halt) = HaltRead::wrap(read_half);
 
         // Keep track of the write_half and generate a stream_id
-        let sender: Sender<OutSi> = Sender::new(framed_write_half, halt);
+        let sender: Sender<OutSi> = Sender::new(write_half, halt);
 
         let (stream_id_tx, stream_id_rx) = oneshot::channel();
         self.senders_channel
@@ -224,6 +226,9 @@ where
     InSt: Stream + Send + Unpin + 'static,
     InSt::Item: Send,
 {
+    /// Awaits incoming channel joins and messages from those streams in the channel.
+    ///
+    /// If there is backpressure, joining the channel also slows.
     fn run_channel(
         channel: usize,
         mut reader: SelectAll<StreamMover<IncomingPacketReader<InSt>>>,
@@ -235,9 +240,7 @@ where
         tokio::task::spawn(async move {
             loop {
                 tracing::trace!(channel, "incoming loop start");
-                // We do not have an incoming packet
                 tokio::select! {
-                    // FIXME: This block is duplicated, down below
                     packet_reader = incoming_packet_reader_rx.recv() => {
                         tracing::trace!("incoming socket (none)");
                         match packet_reader {
@@ -281,7 +284,6 @@ where
     Out: Stream<Item = OutgoingPacket<OutItem>>,
     OutItem: Clone,
     OutSi: Sink<OutItem>,
-    OutSi::Error: std::fmt::Debug,
 
     Id: Send + Unpin + 'static,
     InSt: Send + Unpin + 'static,
@@ -290,10 +292,12 @@ where
     OutItem: Send + Sync + 'static,
     OutSi: Send + Unpin + 'static,
 {
-    #[tracing::instrument(level = "debug", skip(incoming_write_halves, control))]
+    /// Start the multiplexer. Giving it a stream of incoming connection halves and a stream for
+    /// ControlMessages.
+    #[tracing::instrument(level = "debug", skip(incoming_halves, control))]
     pub async fn run<V, U>(
         mut self,
-        mut incoming_write_halves: V,
+        mut incoming_halves: V,
         mut control: U,
     ) -> JoinHandle<IoResult<()>>
     where
@@ -351,10 +355,10 @@ where
         tokio::task::spawn(async move {
             loop {
                 tokio::select!(
-                    incoming_opt = incoming_write_halves.next() => {
+                    incoming_opt = incoming_halves.next() => {
                         match incoming_opt {
-                            Some(Ok((framed_write_half, framed_read_half))) => {
-                                self.handle_incoming_connection(framed_write_half, framed_read_half, &mut incoming_packet_reader_tx).await;
+                            Some(Ok((write_half, read_half))) => {
+                                self.handle_incoming_connection(write_half, read_half, &mut incoming_packet_reader_tx).await;
                             }
                             Some(Err(error)) => {
                                 tracing::error!("ERROR: {}", error);

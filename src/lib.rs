@@ -1,4 +1,3 @@
-/* FIXME
 #![warn(
     missing_docs,
     missing_debug_implementations,
@@ -11,8 +10,16 @@
     unused_import_braces,
     unused_qualifications
 )]
+/* FIXME
 #![cfg_attr(debug_assertions, allow(dead_code))]
 #![cfg_attr(test, allow(dead_code))]
+*/
+/*!
+This crate provides stream multiplexing with channels.
+
+Channels have their own backpressure that does not affect other channels.
+
+Incoming streams are by default set to channel 0 and can be moved to other channels via `ControlMessage`s.
 */
 mod error;
 mod halt;
@@ -22,40 +29,53 @@ mod multiplexer_senders;
 mod send_all_own;
 mod sender;
 mod stream_mover;
-mod stream_producer;
 
 pub use error::*;
 use halt::*;
 pub use id_gen::*;
 pub use multiplexer::*;
-pub use multiplexer_senders::*;
+use multiplexer_senders::*;
 use send_all_own::*;
 use sender::*;
 use stream_mover::*;
-pub use stream_producer::*;
 
 type StreamId = usize;
 
 /// Produced by the incoming stream
-#[derive(Clone, PartialEq, Debug)]
 pub enum IncomingMessage<V> {
     /// Value received from a stream
     Value(V),
     /// Sent when the stream has gone linkdead
     Linkdead,
 }
-/// A packet representing a message for a stream
-#[derive(Clone, PartialEq, Debug)]
+impl<V> std::fmt::Debug for IncomingMessage<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IncomingMessage::Value(_) => write!(f, "IncomingMessage::Value(_)"),
+            IncomingMessage::Linkdead => write!(f, "IncomingMessage::Linkdead"),
+        }
+    }
+}
+/// A packet representing a message from a stream.
 pub struct IncomingPacket<V> {
     id: StreamId,
     message: IncomingMessage<V>,
 }
+impl<V> std::fmt::Debug for IncomingPacket<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncomingPacket")
+            .field("id", &self.id)
+            .field("message", &self.message)
+            .finish()
+    }
+}
 impl<V> IncomingPacket<V> {
+    /// Wraps a message that will be sent to the stream with the given `id`.
     pub fn new(id: StreamId, message: IncomingMessage<V>) -> Self {
         Self { id, message }
     }
 
-    /// The id the message is from.
+    /// The id of the stream that the message is from.
     pub fn id(&self) -> StreamId {
         self.id
     }
@@ -75,7 +95,7 @@ impl<V> IncomingPacket<V> {
 }
 
 /// The payload of an OutgoingPacket
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Clone)]
 pub enum OutgoingMessage<V> {
     /// Value to send to the stream
     Value(V),
@@ -85,19 +105,34 @@ pub enum OutgoingMessage<V> {
     Shutdown,
 }
 impl<V> Unpin for OutgoingMessage<V> where V: Unpin {}
+impl<V> std::fmt::Debug for OutgoingMessage<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutgoingMessage::Value(_) => write!(f, "OutgoingMessage::Value(_)"),
+            OutgoingMessage::ChangeChannel(channel) => {
+                write!(f, "OutgoingMessage::ChangeChannel({})", channel)
+            }
+            OutgoingMessage::Shutdown => write!(f, "OutgoingMessage::Shutdown"),
+        }
+    }
+}
 
 /// For sending Value or causing the stream to change to a different channel
-#[derive(Clone, PartialEq, Debug)]
 pub struct OutgoingPacket<V> {
     /// List of streams this packet is for.
     ids: Vec<StreamId>,
     /// The packet payload
     message: OutgoingMessage<V>,
 }
-impl<V> OutgoingPacket<V>
-where
-    V: std::fmt::Debug + PartialEq + Clone,
-{
+impl<V> std::fmt::Debug for OutgoingPacket<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutgoingPacket")
+            .field("ids", &self.ids)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+impl<V> OutgoingPacket<V> {
     /// Creates an OutoingPacket message for a list of streams.
     pub fn new(ids: Vec<StreamId>, message: OutgoingMessage<V>) -> Self {
         Self { ids, message }

@@ -13,20 +13,20 @@ struct Inner {
 }
 
 #[derive(Clone, Debug)]
-pub struct HaltRead {
+pub(crate) struct HaltRead {
     inner: Arc<Inner>,
 }
 
 impl HaltRead {
     #[tracing::instrument(level = "trace", skip(self))]
-    pub fn signal(&self) {
+    pub(crate) fn signal(&self) {
         tracing::trace!("setting atomic bool, triggering waker");
         self.inner.set.store(true, Relaxed);
         self.inner.waker.wake();
     }
 
     #[tracing::instrument(level = "trace", skip(read))]
-    pub fn wrap<St>(read: St) -> (Self, HaltAsyncRead<St>)
+    pub(crate) fn wrap<St>(read: St) -> (Self, HaltAsyncRead<St>)
     where
         St: Stream,
     {
@@ -47,7 +47,7 @@ impl HaltRead {
 }
 
 #[derive(Debug)]
-pub struct HaltAsyncRead<St> {
+pub(crate) struct HaltAsyncRead<St> {
     inner: Arc<Inner>,
     read: Option<St>,
 }

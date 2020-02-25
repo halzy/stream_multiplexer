@@ -1,10 +1,18 @@
 use crate::*;
 
-pub struct Sender<Si> {
+/// Holds the write-half, it's stream id, and a control structure to shutdown the read-half when it is
+/// dropped.
+pub(crate) struct Sender<Si> {
+    // Optional, because it is set late.
     stream_id: Option<StreamId>,
+
+    // The write half of the stream
     sink: Option<Si>,
+
+    // Control structure that is used to stop and drop the read half
     read_halt: HaltRead,
 }
+
 impl<Si> Unpin for Sender<Si> where Si: Unpin {}
 
 impl<Si> std::fmt::Debug for Sender<Si> {
@@ -15,7 +23,7 @@ impl<Si> std::fmt::Debug for Sender<Si> {
 
 impl<Si> Sender<Si> {
     #[tracing::instrument(level = "trace", skip(sink, read_halt))]
-    pub fn new(sink: Si, read_halt: HaltRead) -> Self {
+    pub(crate) fn new(sink: Si, read_halt: HaltRead) -> Self {
         Self {
             stream_id: None,
             sink: Some(sink),
