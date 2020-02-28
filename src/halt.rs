@@ -93,6 +93,12 @@ where
 
     #[tracing::instrument(level = "trace", skip(self, ctx))]
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
+        // We may have gone linkdead and ejected the read early
+        if self.read.is_none() {
+            tracing::trace!("Returning none from Linkdead state");
+            return Poll::Ready(None);
+        }
+
         // quick check to avoid registration if already done.
         if self.inner.set.load(Relaxed) {
             tracing::trace!("pre-waker shutdown");
@@ -115,10 +121,15 @@ where
             let value = futures::ready!(Pin::new(&mut self.read.as_mut().unwrap()).poll_next(ctx));
             match value {
                 Some(value) => {
-                    let message = IncomingMessage::Value(value);
-                    Poll::Ready(Some(IncomingPacket::new(self.stream_id(), message)))
+                    let message = IncomingMessage::new(self.stream_id(), value);
+                    Poll::Ready(Some(IncomingPacket::Message(message)))
                 }
-                None => Poll::Ready(None),
+                None => {
+                    // FIXME: test this
+                    // Take the read out ouf the option to signal that the stream is done
+                    let _ = self.shutdown();
+                    Poll::Ready(Some(IncomingPacket::Linkdead(self.stream_id())))
+                }
             }
         }
     }

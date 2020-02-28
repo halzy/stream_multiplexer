@@ -42,54 +42,55 @@ use stream_mover::*;
 type StreamId = usize;
 
 /// Produced by the incoming stream
-pub enum IncomingMessage<V> {
+pub struct IncomingMessage<V> {
+    /// Stream Id that the message if for
+    id: StreamId,
     /// Value received from a stream
-    Value(V),
-    /// Sent when the stream has gone linkdead
-    Linkdead,
+    value: V,
 }
+
 impl<V> std::fmt::Debug for IncomingMessage<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IncomingMessage::Value(_) => write!(f, "IncomingMessage::Value(_)"),
-            IncomingMessage::Linkdead => write!(f, "IncomingMessage::Linkdead"),
-        }
-    }
-}
-/// A packet representing a message from a stream.
-pub struct IncomingPacket<V> {
-    id: StreamId,
-    message: IncomingMessage<V>,
-}
-impl<V> std::fmt::Debug for IncomingPacket<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IncomingPacket")
+        f.debug_struct("IncomingMessage")
             .field("id", &self.id)
-            .field("message", &self.message)
             .finish()
     }
 }
+
+impl<V> IncomingMessage<V> {
+    pub fn new(id: StreamId, value: V) -> Self {
+        Self { id, value }
+    }
+}
+
+/// A packet representing a message from a stream.
+pub enum IncomingPacket<V> {
+    Linkdead(StreamId),
+    Message(IncomingMessage<V>),
+}
+
 impl<V> IncomingPacket<V> {
-    /// Wraps a message that will be sent to the stream with the given `id`.
-    pub fn new(id: StreamId, message: IncomingMessage<V>) -> Self {
-        Self { id, message }
-    }
-
-    /// The id of the stream that the message is from.
     pub fn id(&self) -> StreamId {
-        self.id
+        match self {
+            IncomingPacket::Message(IncomingMessage { id, .. }) => *id,
+            IncomingPacket::Linkdead(id) => *id,
+        }
     }
-
-    /// The payload of the message.
-    pub fn message(&self) -> &IncomingMessage<V> {
-        &self.message
-    }
-
-    /// If the message has a value, returns `Some(value)`, otherwise `None`
     pub fn value(&self) -> Option<&V> {
-        match &self.message {
-            IncomingMessage::Value(value) => Some(value),
+        match self {
+            IncomingPacket::Message(IncomingMessage { value, .. }) => Some(value),
             _ => None,
+        }
+    }
+}
+
+impl<V> std::fmt::Debug for IncomingPacket<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IncomingPacket::Linkdead(id) => write!(f, "IncomingPacket::Linkdead({})", id),
+            IncomingPacket::Message(message) => {
+                write!(f, "IncomingPacket::IncomingMessage({:?})", &message)
+            }
         }
     }
 }
@@ -136,6 +137,14 @@ impl<V> OutgoingPacket<V> {
     /// Creates an OutoingPacket message for a list of streams.
     pub fn new(ids: Vec<StreamId>, message: OutgoingMessage<V>) -> Self {
         Self { ids, message }
+    }
+
+    /// Creates an OutgoingPacket with OutgoingMessage::Value(value)
+    pub fn with_value(ids: Vec<StreamId>, value: V) -> Self {
+        Self {
+            ids,
+            message: OutgoingMessage::Value(value),
+        }
     }
     /// Utility function to create a ChangeChannel packet.
     pub fn change_channel(id: StreamId, channel_id: usize) -> Self {

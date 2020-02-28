@@ -8,54 +8,56 @@ use tokio::task::JoinHandle;
 use std::collections::HashMap;
 use std::io::Result as IoResult;
 
-type IncomingPacketReader<InSt> = HaltAsyncRead<InSt>;
-type IncomingPacketReaderTx<InSt> =
-    mpsc::UnboundedSender<(usize, StreamMover<IncomingPacketReader<InSt>>)>;
-type StreamMovers<InSt> = HashMap<
+type IncomingPacketReader<ReadSt> = HaltAsyncRead<ReadSt>;
+type IncomingPacketReaderTx<ReadSt> =
+    mpsc::UnboundedSender<(usize, StreamMover<IncomingPacketReader<ReadSt>>)>;
+type StreamMovers<ReadSt> = HashMap<
     StreamId,
     (
         StreamMoverControl,
-        oneshot::Receiver<IncomingPacketReader<InSt>>,
+        oneshot::Receiver<IncomingPacketReader<ReadSt>>,
     ),
 >;
 
+// FIXME: Document what the different generics mean
 /// Manages incoming streams of data and the enqueueing of outgoing data.
 ///
 /// Outgoing streams have their own buffer of messages and do not affect other streams.
 /// Incoming streams have their messages routed into channels that have their own backpressure.
-pub struct Multiplexer<InSt, Out, OutItem, OutSi, Id>
+pub struct Multiplexer<Item, ReadSt, WriteSi, OutSt, Id = IncrementIdGen>
 where
-    InSt: Stream,
+    ReadSt: Stream,
 {
-    readers: Option<Vec<SelectAll<StreamMover<IncomingPacketReader<InSt>>>>>,
-    senders: Option<MultiplexerSenders<OutItem, OutSi, Id>>,
-    outgoing: Out,
-    incoming_packet_sinks: Option<Vec<mpsc::Sender<IncomingPacket<InSt::Item>>>>,
-    stream_movers: StreamMovers<InSt>,
-    senders_channel: mpsc::UnboundedSender<(Sender<OutSi>, oneshot::Sender<StreamId>)>,
-    messages_channel: mpsc::UnboundedSender<(StreamId, OutgoingMessage<OutItem>)>,
+    readers: Option<Vec<SelectAll<StreamMover<IncomingPacketReader<ReadSt>>>>>,
+    senders: Option<MultiplexerSenders<Item, WriteSi, Id>>,
+    outgoing: OutSt,
+    incoming_packet_sinks: Option<Vec<mpsc::Sender<IncomingPacket<ReadSt::Item>>>>,
+    stream_movers: StreamMovers<ReadSt>,
+    senders_channel: mpsc::UnboundedSender<(Sender<WriteSi>, oneshot::Sender<StreamId>)>,
+    messages_channel: mpsc::UnboundedSender<(StreamId, OutgoingMessage<Item>)>,
 }
 
-impl<InSt, Out, OutItem, OutSi, Id> std::fmt::Debug for Multiplexer<InSt, Out, OutItem, OutSi, Id>
+impl<Item, ReadSt, WriteSi, OutSt, Id> std::fmt::Debug
+    for Multiplexer<Item, ReadSt, WriteSi, OutSt, Id>
 where
-    InSt: Stream,
+    ReadSt: Stream,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Multiplexer").finish()
     }
 }
 
-impl<InSt, Out, OutItem, OutSi> Multiplexer<InSt, Out, OutItem, OutSi, IncrementIdGen>
+impl<Item, ReadSt, WriteSi, OutSt> Multiplexer<Item, ReadSt, WriteSi, OutSt, IncrementIdGen>
 where
-    InSt: Stream + Unpin,
-    OutSi: Sink<OutItem> + Unpin,
+    ReadSt: Stream + Unpin,
+    WriteSi: Sink<Item> + Unpin,
 {
     // FIXME: Consider taking a function that can determine which channel a packet should be in
     /// Calls `with_id_gen`, giving it an IncrementIdGen as well as the rest of the arguments.
     pub fn new(
         sender_buffer_size: usize,
-        outgoing: Out,
-        incoming_packet_sinks: Vec<mpsc::Sender<IncomingPacket<InSt::Item>>>,
+        outgoing: OutSt,
+        incoming_packet_sinks: Vec<mpsc::Sender<IncomingPacket<ReadSt::Item>>>,
     ) -> Self {
         let id_gen = IncrementIdGen::default();
 
@@ -63,10 +65,10 @@ where
     }
 }
 
-impl<InSt, Out, OutItem, OutSi, Id> Multiplexer<InSt, Out, OutItem, OutSi, Id>
+impl<Item, ReadSt, WriteSi, OutSt, Id> Multiplexer<Item, ReadSt, WriteSi, OutSt, Id>
 where
-    InSt: Stream + Unpin,
-    OutSi: Sink<OutItem> + Unpin,
+    ReadSt: Stream + Unpin,
+    WriteSi: Sink<Item> + Unpin,
 {
     /// Initializes with a stream that provides the outgoing packets which will be enqueued to the
     /// corresponding streams, and a vector of sinks that represent different "channels" or
@@ -74,8 +76,8 @@ where
     pub fn with_id_gen(
         sender_buffer_size: usize,
         id_gen: Id,
-        outgoing: Out,
-        incoming_packet_sinks: Vec<mpsc::Sender<IncomingPacket<InSt::Item>>>,
+        outgoing: OutSt,
+        incoming_packet_sinks: Vec<mpsc::Sender<IncomingPacket<ReadSt::Item>>>,
     ) -> Self {
         if incoming_packet_sinks.is_empty() {
             panic!("Must have at least one packet sink");
@@ -109,16 +111,16 @@ where
     }
 }
 
-impl<InSt, Out, OutItem, OutSi, Id> Multiplexer<InSt, Out, OutItem, OutSi, Id>
+impl<Item, ReadSt, WriteSi, OutSt, Id> Multiplexer<Item, ReadSt, WriteSi, OutSt, Id>
 where
-    InSt: Stream + Unpin,
-    OutItem: Clone,
+    ReadSt: Stream + Unpin,
+    Item: Clone,
 {
     async fn change_channel(
         &mut self,
         ids: &Vec<StreamId>,
         channel: usize,
-        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<InSt>,
+        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<ReadSt>,
     ) {
         tracing::trace!(?ids, ?channel, "change channel");
         for id in ids {
@@ -154,8 +156,8 @@ where
         &mut self,
         stream_id: StreamId,
         channel: usize,
-        reader: IncomingPacketReader<InSt>,
-        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<InSt>,
+        reader: IncomingPacketReader<ReadSt>,
+        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<ReadSt>,
     ) {
         // Wrap the packet reader in a StreamMover
         // FIXME: Duplicated in change_channel
@@ -184,9 +186,9 @@ where
     )]
     async fn handle_incoming_connection(
         &mut self,
-        write_half: OutSi,
-        read_half: InSt,
-        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<InSt>,
+        write_half: WriteSi,
+        read_half: ReadSt,
+        incoming_packet_reader_tx: &mut IncomingPacketReaderTx<ReadSt>,
     ) {
         tracing::trace!("new connection");
 
@@ -194,7 +196,7 @@ where
         let (halt, mut async_read_halt) = HaltRead::wrap(read_half);
 
         // Keep track of the write_half and generate a stream_id
-        let sender: Sender<OutSi> = Sender::new(write_half, halt);
+        let sender: Sender<WriteSi> = Sender::new(write_half, halt);
 
         let (stream_id_tx, stream_id_rx) = oneshot::channel();
         self.senders_channel
@@ -211,7 +213,7 @@ where
     async fn handle_outgoing_message(
         &mut self,
         ids: &Vec<StreamId>,
-        message: &OutgoingMessage<OutItem>,
+        message: &OutgoingMessage<Item>,
     ) {
         for id in ids {
             tracing::trace!(stream=?id, "sending");
@@ -223,20 +225,20 @@ where
     }
 }
 
-impl<InSt, Out, OutItem, OutSi, Id> Multiplexer<InSt, Out, OutItem, OutSi, Id>
+impl<Item, ReadSt, WriteSi, OutSt, Id> Multiplexer<Item, ReadSt, WriteSi, OutSt, Id>
 where
-    InSt: Stream + Send + Unpin + 'static,
-    InSt::Item: Send,
+    ReadSt: Stream + Send + Unpin + 'static,
+    ReadSt::Item: Send,
 {
     /// Awaits incoming channel joins and messages from those streams in the channel.
     ///
     /// If there is backpressure, joining the channel also slows.
     fn run_channel(
         channel: usize,
-        mut reader: SelectAll<StreamMover<IncomingPacketReader<InSt>>>,
-        mut incoming_packet_sink: mpsc::Sender<IncomingPacket<InSt::Item>>,
+        mut reader: SelectAll<StreamMover<IncomingPacketReader<ReadSt>>>,
+        mut incoming_packet_sink: mpsc::Sender<IncomingPacket<ReadSt::Item>>,
         mut incoming_packet_reader_rx: mpsc::UnboundedReceiver<
-            StreamMover<IncomingPacketReader<InSt>>,
+            StreamMover<IncomingPacketReader<ReadSt>>,
         >,
     ) -> JoinHandle<()> {
         tokio::task::spawn(async move {
@@ -267,13 +269,6 @@ where
                             }
                             None => {
                                 tracing::error!("incoming reader received None");
-                                let message = IncomingMessage::Linkdead;
-                                let packet = IncomingPacket::new(channel, message);
-                                tracing::trace!(channel, "sending data");
-                                if let Err(_) = incoming_packet_sink.send(packet).await {
-                                    tracing::error!("Shutting down receive loop");
-                                    return;
-                                }
                             }
                         }
                     }
@@ -283,20 +278,19 @@ where
     }
 }
 
-impl<InSt, Out, OutItem, OutSi, Id> Multiplexer<InSt, Out, OutItem, OutSi, Id>
+impl<Item, ReadSt, WriteSi, OutSt, Id> Multiplexer<Item, ReadSt, WriteSi, OutSt, Id>
 where
     Id: IdGen,
-    InSt: Stream,
-    Out: Stream<Item = OutgoingPacket<OutItem>>,
-    OutItem: Clone,
-    OutSi: Sink<OutItem>,
+    OutSt: Stream<Item = OutgoingPacket<Item>>,
+    ReadSt: Stream,
+    WriteSi: Sink<Item>,
 
     Id: Send + Unpin + 'static,
-    InSt: Send + Unpin + 'static,
-    InSt::Item: Send,
-    Out: Send + Unpin + 'static,
-    OutItem: Send + Sync + 'static,
-    OutSi: Send + Unpin + 'static,
+    Item: Clone + Send + Sync + 'static,
+    OutSt: Send + Unpin + 'static,
+    ReadSt: Send + Unpin + 'static,
+    ReadSt::Item: Send,
+    WriteSi: Send + Unpin + 'static,
 {
     /// Start the multiplexer. Giving it a stream of incoming connection halves and a stream for
     /// ControlMessages.
@@ -307,7 +301,7 @@ where
         mut control: U,
     ) -> JoinHandle<IoResult<()>>
     where
-        V: Stream<Item = IoResult<(OutSi, InSt)>>,
+        V: Stream<Item = IoResult<(WriteSi, ReadSt)>>,
         V: Unpin + Send + 'static,
         U: Stream<Item = ControlMessage> + Send + Unpin + 'static,
     {

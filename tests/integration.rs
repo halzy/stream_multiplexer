@@ -289,7 +289,7 @@ async fn change_channel() {
 
 #[tokio::test(basic_scheduler)]
 async fn linkdead() {
-    //init_logging();
+    // init_logging();
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
     let socket = TcpStreamProducer::new(socket);
@@ -314,7 +314,10 @@ async fn linkdead() {
     // cleanup
     client1.shutdown(std::net::Shutdown::Both).unwrap();
 
-    dbg!(in_data_rx.recv().await);
+    // Validate that a linkdead packet is sent.
+    let message = in_data_rx.recv().await.expect("should have gone linkdead");
+    assert_eq!(client1_id, message.id());
+    matches::assert_matches!(message, IncomingPacket::Linkdead(_));
 
     // Stop multiplexer
     control_write.send(ControlMessage::Shutdown).unwrap();
