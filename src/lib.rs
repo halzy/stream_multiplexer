@@ -58,29 +58,40 @@ impl<V> std::fmt::Debug for IncomingMessage<V> {
 }
 
 impl<V> IncomingMessage<V> {
-    pub fn new(id: StreamId, value: V) -> Self {
+    pub(crate) fn new(id: StreamId, value: V) -> Self {
         Self { id, value }
     }
 }
 
 /// A packet representing a message from a stream.
 pub enum IncomingPacket<V> {
+    /// The stream with ID has gone linkdead.
     Linkdead(StreamId),
+
+    /// The stream has produced a message.
     Message(IncomingMessage<V>),
 }
 
 impl<V> IncomingPacket<V> {
+    /// Return the ID of the stream that the packet represents.
     pub fn id(&self) -> StreamId {
         match self {
             IncomingPacket::Message(IncomingMessage { id, .. }) => *id,
             IncomingPacket::Linkdead(id) => *id,
         }
     }
+
+    /// If there is a value, return a reference to it
     pub fn value(&self) -> Option<&V> {
         match self {
             IncomingPacket::Message(IncomingMessage { value, .. }) => Some(value),
             _ => None,
         }
+    }
+}
+impl<V> From<IncomingMessage<V>> for IncomingPacket<V> {
+    fn from(message: IncomingMessage<V>) -> Self {
+        Self::Message(message)
     }
 }
 
@@ -97,62 +108,52 @@ impl<V> std::fmt::Debug for IncomingPacket<V> {
 
 /// The payload of an OutgoingPacket
 #[derive(Clone)]
-pub enum OutgoingMessage<V> {
-    /// Value to send to the stream
-    Value(V),
-    /// Which channel to change to
-    ChangeChannel(usize),
-    /// Shutdown the socket
-    Shutdown,
+pub struct OutgoingMessage<V> {
+    ids: Vec<StreamId>,
+    value: V,
 }
-impl<V> Unpin for OutgoingMessage<V> where V: Unpin {}
-impl<V> std::fmt::Debug for OutgoingMessage<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OutgoingMessage::Value(_) => write!(f, "OutgoingMessage::Value(_)"),
-            OutgoingMessage::ChangeChannel(channel) => {
-                write!(f, "OutgoingMessage::ChangeChannel({})", channel)
-            }
-            OutgoingMessage::Shutdown => write!(f, "OutgoingMessage::Shutdown"),
-        }
+impl<V> OutgoingMessage<V> {
+    /// Creates a new message that is to be delivered to streams with `ids`.
+    pub fn new(ids: Vec<StreamId>, value: V) -> Self {
+        Self { ids, value }
     }
 }
 
-/// For sending Value or causing the stream to change to a different channel
-pub struct OutgoingPacket<V> {
-    /// List of streams this packet is for.
-    ids: Vec<StreamId>,
-    /// The packet payload
-    message: OutgoingMessage<V>,
-}
-impl<V> std::fmt::Debug for OutgoingPacket<V> {
+impl<V> std::fmt::Debug for OutgoingMessage<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutgoingPacket")
+        f.debug_struct("OutgoingMessage")
             .field("ids", &self.ids)
-            .field("message", &self.message)
             .finish()
     }
 }
-impl<V> OutgoingPacket<V> {
-    /// Creates an OutoingPacket message for a list of streams.
-    pub fn new(ids: Vec<StreamId>, message: OutgoingMessage<V>) -> Self {
-        Self { ids, message }
-    }
+impl<V> Unpin for OutgoingMessage<V> where V: Unpin {}
 
-    /// Creates an OutgoingPacket with OutgoingMessage::Value(value)
-    pub fn with_value(ids: Vec<StreamId>, value: V) -> Self {
-        Self {
-            ids,
-            message: OutgoingMessage::Value(value),
+/// For sending a message or causing the stream to change to a different channel
+pub enum OutgoingPacket<V> {
+    /// Message to send to the stream
+    Message(OutgoingMessage<V>),
+
+    /// Change change of stream_id to channel_id.
+    ChangeChannel(Vec<StreamId>, usize),
+
+    /// Shutdown the stream
+    Shutdown(Vec<StreamId>),
+}
+impl<V> std::fmt::Debug for OutgoingPacket<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutgoingPacket::Message(message) => write!(f, "OutgoingPacket::Message({:?})", message),
+            OutgoingPacket::ChangeChannel(ids, channel) => {
+                write!(f, "OutgoingPacket::ChangeChannel({:?}, {})", ids, channel)
+            }
+            OutgoingPacket::Shutdown(ids) => write!(f, "OutgoingPacket::Shutdown({:?})", ids),
         }
     }
-    /// Utility function to create a ChangeChannel packet.
-    pub fn change_channel(id: StreamId, channel_id: usize) -> Self {
-        let message = OutgoingMessage::ChangeChannel(channel_id);
-        Self {
-            ids: vec![id],
-            message,
-        }
+}
+
+impl<V> From<OutgoingMessage<V>> for OutgoingPacket<V> {
+    fn from(message: OutgoingMessage<V>) -> Self {
+        Self::Message(message)
     }
 }
 

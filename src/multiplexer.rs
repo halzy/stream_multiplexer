@@ -34,7 +34,7 @@ where
     incoming_packet_sinks: Option<Vec<mpsc::Sender<IncomingPacket<ReadSt::Item>>>>,
     stream_movers: StreamMovers<ReadSt>,
     senders_channel: mpsc::UnboundedSender<(Sender<WriteSi>, oneshot::Sender<StreamId>)>,
-    messages_channel: mpsc::UnboundedSender<(StreamId, OutgoingMessage<Item>)>,
+    messages_channel: mpsc::UnboundedSender<OutgoingMessage<Item>>,
 }
 
 impl<Item, ReadSt, WriteSi, OutSt, Id> std::fmt::Debug
@@ -118,7 +118,7 @@ where
 {
     async fn change_channel(
         &mut self,
-        ids: &Vec<StreamId>,
+        ids: Vec<StreamId>,
         channel: usize,
         incoming_packet_reader_tx: &mut IncomingPacketReaderTx<ReadSt>,
     ) {
@@ -137,7 +137,7 @@ where
                     match receiver.await {
                         Ok(packet_reader) => {
                             self.enqueue_packet_reader(
-                                *id,
+                                id,
                                 channel,
                                 packet_reader,
                                 incoming_packet_reader_tx,
@@ -207,21 +207,6 @@ where
         async_read_halt.set_stream_id(stream_id);
 
         self.enqueue_packet_reader(stream_id, 0, async_read_halt, incoming_packet_reader_tx);
-    }
-
-    #[tracing::instrument(level = "trace", skip(self, ids, message))]
-    async fn handle_outgoing_message(
-        &mut self,
-        ids: &Vec<StreamId>,
-        message: &OutgoingMessage<Item>,
-    ) {
-        for id in ids {
-            tracing::trace!(stream=?id, "sending");
-            // FIXME: What should we do if there are send errors?
-            if let Err(error) = self.messages_channel.send((*id, message.clone())) {
-                tracing::error!(%error, "outgoing packet");
-            }
-        }
     }
 }
 
@@ -345,10 +330,12 @@ where
             }
         });
 
+        let (shutdown_ids_tx, shutdown_ids_rx) = mpsc::unbounded_channel();
+
         let mut senders = self.senders.take().expect("Senders should exist until now");
         tokio::task::spawn(async move {
             tracing::trace!("starting senders poll() loop task");
-            senders.run_to_completion().await;
+            senders.run_to_completion(shutdown_ids_rx).await;
             tracing::trace!("leaving senders poll() loop");
         });
 
@@ -368,12 +355,19 @@ where
                     }
                     outgoing_opt = self.outgoing.next() => {
                         if let Some(outgoing_packet) = outgoing_opt {
-                            match &outgoing_packet.message {
-                                OutgoingMessage::ChangeChannel(channel) => {
-                                    self.change_channel(&outgoing_packet.ids, *channel, &mut incoming_packet_reader_tx).await;
+                            match outgoing_packet {
+                                OutgoingPacket::ChangeChannel(ids, channel) => {
+                                    self.change_channel(ids, channel, &mut incoming_packet_reader_tx).await;
                                 }
-                                message => {
-                                    self.handle_outgoing_message(&outgoing_packet.ids, message).await;
+                                OutgoingPacket::Shutdown(ids) => {
+                                    if let Err(err) = shutdown_ids_tx.send(ids) {
+                                        tracing::error!(?err, "Error sending shutdowns.");
+                                    }
+                                }
+                                OutgoingPacket::Message(message) => {
+                                    if let Err(error) = self.messages_channel.send(message) {
+                                        tracing::error!(%error, "outgoing packet");
+                                    }
                                 }
                             }
                         }
