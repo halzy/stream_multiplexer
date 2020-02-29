@@ -52,7 +52,7 @@ pub(crate) struct MultiplexerSenders<Item, Si, Id> {
 
     // Channels that provide new senders and messages
     senders_channel: mpsc::UnboundedReceiver<(Sender<Si>, oneshot::Sender<StreamId>)>,
-    messages_channel: mpsc::UnboundedReceiver<(StreamId, OutgoingMessage<Item>)>,
+    messages_channel: mpsc::UnboundedReceiver<OutgoingMessage<Item>>,
 }
 
 impl<Item, Si, Id> MultiplexerSenders<Item, Si, Id>
@@ -63,7 +63,7 @@ where
         sender_buffer_size: usize,
         id_gen: Id,
         senders_channel: mpsc::UnboundedReceiver<(Sender<Si>, oneshot::Sender<StreamId>)>,
-        messages_channel: mpsc::UnboundedReceiver<(StreamId, OutgoingMessage<Item>)>,
+        messages_channel: mpsc::UnboundedReceiver<OutgoingMessage<Item>>,
     ) -> Self {
         Self {
             sender_buffer_size,
@@ -86,6 +86,7 @@ impl<Item, Si, Id> MultiplexerSenders<Item, Si, Id>
 where
     Si: Sink<Item> + Unpin,
     Id: IdGen,
+    Item: Clone,
 {
     #[tracing::instrument(level = "trace", skip(self, sender, stream_id_channel))]
     fn add(&mut self, mut sender: Sender<Si>, stream_id_channel: oneshot::Sender<StreamId>) {
@@ -114,19 +115,10 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_lengths(&self) -> (usize, usize) {
-        let futures_len = self.senders_stream.len();
-        let sender_pairs_len = self.sender_pairs.len();
-        (futures_len, sender_pairs_len)
-    }
-
-    fn handle_new_message(&mut self, (stream_id, message): (StreamId, OutgoingMessage<Item>)) {
-        match message {
-            OutgoingMessage::ChangeChannel(_) => {
-                unreachable!("Message should have been consumed by Multiplexer");
-            }
-            OutgoingMessage::Shutdown => match self.sender_pairs.remove(&stream_id) {
+    /// Returns true if it was shut-down, false otherwise
+    pub(crate) fn shutdown_streams(&mut self, stream_ids: &[StreamId]) {
+        for stream_id in stream_ids {
+            match self.sender_pairs.remove(&stream_id) {
                 Some(_) => {
                     // The Sender could still be in the FuturesUnordered, it should not be
                     // re-inserted into the sender_pairs hashmap.
@@ -135,37 +127,44 @@ where
                 None => {
                     tracing::warn!(stream_id, "Trying to shut down non-existent sender.");
                 }
-            },
-            OutgoingMessage::Value(value) => {
-                match self.sender_pairs.entry(stream_id) {
-                    Entry::Vacant(_) => {
-                        tracing::warn!(stream_id, "Tring to send message to non-existent stream.");
-                    }
-                    Entry::Occupied(mut sender_pair_entry) => {
-                        let sender_pair = sender_pair_entry.get_mut();
-                        match sender_pair.try_send(value) {
-                            Ok(()) => {
-                                // Enqueue the message and move the sender into the FuturesUnordered
-                                tracing::trace!(stream_id, "Enqueued message.");
-                                if let Some(sender) = sender_pair.take() {
-                                    self.senders_stream.push(sender.into_future());
-                                }
-                            }
-                            Err(TrySendError::Full(_)) => {
-                                tracing::error!(stream_id, "Stream is full, shutting down sender.");
-                                sender_pair_entry.remove_entry();
-                            }
-                            Err(TrySendError::Closed(_)) => {
-                                tracing::error!(
-                                    stream_id,
-                                    "Stream is closed, shutting down sender."
-                                );
-                                sender_pair_entry.remove_entry();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lengths(&self) -> (usize, usize) {
+        let futures_len = self.senders_stream.len();
+        let sender_pairs_len = self.sender_pairs.len();
+        (futures_len, sender_pairs_len)
+    }
+
+    fn handle_new_message(&mut self, message: OutgoingMessage<Item>) {
+        for stream_id in message.ids {
+            match self.sender_pairs.entry(stream_id) {
+                Entry::Vacant(_) => {
+                    tracing::warn!(stream_id, "Tring to send message to non-existent stream.");
+                }
+                Entry::Occupied(mut sender_pair_entry) => {
+                    let sender_pair = sender_pair_entry.get_mut();
+                    match sender_pair.try_send(message.value.clone()) {
+                        Ok(()) => {
+                            // Enqueue the message and move the sender into the FuturesUnordered
+                            tracing::trace!(stream_id, "Enqueued message.");
+                            if let Some(sender) = sender_pair.take() {
+                                self.senders_stream.push(sender.into_future());
                             }
                         }
+                        Err(TrySendError::Full(_)) => {
+                            tracing::error!(stream_id, "Stream is full, shutting down sender.");
+                            sender_pair_entry.remove_entry();
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            tracing::error!(stream_id, "Stream is closed, shutting down sender.");
+                            sender_pair_entry.remove_entry();
+                        }
                     }
-                };
-            }
+                }
+            };
         }
     }
 
@@ -199,12 +198,18 @@ where
         }
     }
 
-    pub(crate) async fn run_to_completion(&mut self) {
+    pub(crate) async fn run_to_completion(
+        &mut self,
+        mut shutdown_ids: mpsc::UnboundedReceiver<Vec<StreamId>>,
+    ) {
         tracing::trace!("get_next() starting");
 
         loop {
             tracing::trace!("loop");
             tokio::select! {
+                Some(ids) = shutdown_ids.next() => {
+                    self.shutdown_streams(&ids);
+                }
                 new_sender = self.senders_channel.next() => {
                     match new_sender {
                         None => {
@@ -268,8 +273,10 @@ mod tests {
         let mut multiplexer_senders =
             MultiplexerSenders::new(32, id_gen, sender_channel_rx, message_channel_rx);
 
+        let (shutdown_ids_tx, shutdown_ids_rx) = mpsc::unbounded_channel();
+
         let ms_join = tokio::task::spawn(async move {
-            multiplexer_senders.run_to_completion().await;
+            multiplexer_senders.run_to_completion(shutdown_ids_rx).await;
             multiplexer_senders
         });
 
@@ -291,8 +298,8 @@ mod tests {
 
         // Send some data to the stream
         for x in 0_u8..10 {
-            let message = OutgoingMessage::Value(x);
-            message_channel.send((stream_id, message)).unwrap();
+            let message = OutgoingMessage::new(vec![stream_id], x);
+            message_channel.send(message).unwrap();
         }
 
         // Send some data to the stream
@@ -309,8 +316,9 @@ mod tests {
         }
 
         // Send the shutdown message to the stream
-        let message = OutgoingMessage::Shutdown;
-        message_channel.send((stream_id, message)).unwrap();
+        shutdown_ids_tx
+            .send(vec![stream_id])
+            .expect("should be able to send stream shutdown");
 
         // Await the reader so that it shuts down
         reader.next().await;

@@ -42,108 +42,118 @@ use stream_mover::*;
 type StreamId = usize;
 
 /// Produced by the incoming stream
-pub enum IncomingMessage<V> {
+pub struct IncomingMessage<V> {
+    /// Stream Id that the message if for
+    id: StreamId,
     /// Value received from a stream
-    Value(V),
-    /// Sent when the stream has gone linkdead
-    Linkdead,
+    value: V,
 }
+
 impl<V> std::fmt::Debug for IncomingMessage<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IncomingMessage::Value(_) => write!(f, "IncomingMessage::Value(_)"),
-            IncomingMessage::Linkdead => write!(f, "IncomingMessage::Linkdead"),
-        }
-    }
-}
-/// A packet representing a message from a stream.
-pub struct IncomingPacket<V> {
-    id: StreamId,
-    message: IncomingMessage<V>,
-}
-impl<V> std::fmt::Debug for IncomingPacket<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IncomingPacket")
+        f.debug_struct("IncomingMessage")
             .field("id", &self.id)
-            .field("message", &self.message)
             .finish()
     }
 }
+
+impl<V> IncomingMessage<V> {
+    pub(crate) fn new(id: StreamId, value: V) -> Self {
+        Self { id, value }
+    }
+}
+
+/// A packet representing a message from a stream.
+pub enum IncomingPacket<V> {
+    /// The stream with ID has gone linkdead.
+    Linkdead(StreamId),
+
+    /// The stream has produced a message.
+    Message(IncomingMessage<V>),
+}
+
 impl<V> IncomingPacket<V> {
-    /// Wraps a message that will be sent to the stream with the given `id`.
-    pub fn new(id: StreamId, message: IncomingMessage<V>) -> Self {
-        Self { id, message }
-    }
-
-    /// The id of the stream that the message is from.
+    /// Return the ID of the stream that the packet represents.
     pub fn id(&self) -> StreamId {
-        self.id
+        match self {
+            IncomingPacket::Message(IncomingMessage { id, .. }) => *id,
+            IncomingPacket::Linkdead(id) => *id,
+        }
     }
 
-    /// The payload of the message.
-    pub fn message(&self) -> &IncomingMessage<V> {
-        &self.message
-    }
-
-    /// If the message has a value, returns `Some(value)`, otherwise `None`
+    /// If there is a value, return a reference to it
     pub fn value(&self) -> Option<&V> {
-        match &self.message {
-            IncomingMessage::Value(value) => Some(value),
+        match self {
+            IncomingPacket::Message(IncomingMessage { value, .. }) => Some(value),
             _ => None,
+        }
+    }
+}
+impl<V> From<IncomingMessage<V>> for IncomingPacket<V> {
+    fn from(message: IncomingMessage<V>) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl<V> std::fmt::Debug for IncomingPacket<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IncomingPacket::Linkdead(id) => write!(f, "IncomingPacket::Linkdead({})", id),
+            IncomingPacket::Message(message) => {
+                write!(f, "IncomingPacket::IncomingMessage({:?})", &message)
+            }
         }
     }
 }
 
 /// The payload of an OutgoingPacket
 #[derive(Clone)]
-pub enum OutgoingMessage<V> {
-    /// Value to send to the stream
-    Value(V),
-    /// Which channel to change to
-    ChangeChannel(usize),
-    /// Shutdown the socket
-    Shutdown,
+pub struct OutgoingMessage<V> {
+    ids: Vec<StreamId>,
+    value: V,
 }
-impl<V> Unpin for OutgoingMessage<V> where V: Unpin {}
+impl<V> OutgoingMessage<V> {
+    /// Creates a new message that is to be delivered to streams with `ids`.
+    pub fn new(ids: Vec<StreamId>, value: V) -> Self {
+        Self { ids, value }
+    }
+}
+
 impl<V> std::fmt::Debug for OutgoingMessage<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutgoingMessage")
+            .field("ids", &self.ids)
+            .finish()
+    }
+}
+impl<V> Unpin for OutgoingMessage<V> where V: Unpin {}
+
+/// For sending a message or causing the stream to change to a different channel
+pub enum OutgoingPacket<V> {
+    /// Message to send to the stream
+    Message(OutgoingMessage<V>),
+
+    /// Change change of stream_id to channel_id.
+    ChangeChannel(Vec<StreamId>, usize),
+
+    /// Shutdown the stream
+    Shutdown(Vec<StreamId>),
+}
+impl<V> std::fmt::Debug for OutgoingPacket<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OutgoingMessage::Value(_) => write!(f, "OutgoingMessage::Value(_)"),
-            OutgoingMessage::ChangeChannel(channel) => {
-                write!(f, "OutgoingMessage::ChangeChannel({})", channel)
+            OutgoingPacket::Message(message) => write!(f, "OutgoingPacket::Message({:?})", message),
+            OutgoingPacket::ChangeChannel(ids, channel) => {
+                write!(f, "OutgoingPacket::ChangeChannel({:?}, {})", ids, channel)
             }
-            OutgoingMessage::Shutdown => write!(f, "OutgoingMessage::Shutdown"),
+            OutgoingPacket::Shutdown(ids) => write!(f, "OutgoingPacket::Shutdown({:?})", ids),
         }
     }
 }
 
-/// For sending Value or causing the stream to change to a different channel
-pub struct OutgoingPacket<V> {
-    /// List of streams this packet is for.
-    ids: Vec<StreamId>,
-    /// The packet payload
-    message: OutgoingMessage<V>,
-}
-impl<V> std::fmt::Debug for OutgoingPacket<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutgoingPacket")
-            .field("ids", &self.ids)
-            .field("message", &self.message)
-            .finish()
-    }
-}
-impl<V> OutgoingPacket<V> {
-    /// Creates an OutoingPacket message for a list of streams.
-    pub fn new(ids: Vec<StreamId>, message: OutgoingMessage<V>) -> Self {
-        Self { ids, message }
-    }
-    /// Utility function to create a ChangeChannel packet.
-    pub fn change_channel(id: StreamId, channel_id: usize) -> Self {
-        let message = OutgoingMessage::ChangeChannel(channel_id);
-        Self {
-            ids: vec![id],
-            message,
-        }
+impl<V> From<OutgoingMessage<V>> for OutgoingPacket<V> {
+    fn from(message: OutgoingMessage<V>) -> Self {
+        Self::Message(message)
     }
 }
 

@@ -135,10 +135,7 @@ async fn write_packets() {
     // send a message
     let data = Bytes::from("a message");
     data_write
-        .send(OutgoingPacket::new(
-            vec![client1_id],
-            OutgoingMessage::Value(data.clone()),
-        ))
+        .send(OutgoingMessage::new(vec![client1_id], data.clone()).into())
         .unwrap();
 
     let mut read_data = BytesMut::new();
@@ -247,16 +244,13 @@ async fn change_channel() {
     );
 
     // Switch client1 from channel 0 to channel 1
-    let change_channel = OutgoingPacket::new(vec![client1_id], OutgoingMessage::ChangeChannel(1));
+    let change_channel = OutgoingPacket::ChangeChannel(vec![client1_id], 1);
     data_write.send(change_channel).unwrap();
 
     // send a message to the client (so that the client waits and we can change channels)
     let data = Bytes::from("a message from the server");
     data_write
-        .send(OutgoingPacket::new(
-            vec![client1_id],
-            OutgoingMessage::Value(data.clone()),
-        ))
+        .send(OutgoingMessage::new(vec![client1_id], data.clone()).into())
         .unwrap();
 
     // client reads data
@@ -289,7 +283,7 @@ async fn change_channel() {
 
 #[tokio::test(basic_scheduler)]
 async fn linkdead() {
-    //init_logging();
+    // init_logging();
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
     let socket = TcpStreamProducer::new(socket);
@@ -314,7 +308,10 @@ async fn linkdead() {
     // cleanup
     client1.shutdown(std::net::Shutdown::Both).unwrap();
 
-    dbg!(in_data_rx.recv().await);
+    // Validate that a linkdead packet is sent.
+    let message = in_data_rx.recv().await.expect("should have gone linkdead");
+    assert_eq!(client1_id, message.id());
+    matches::assert_matches!(message, IncomingPacket::Linkdead(_));
 
     // Stop multiplexer
     control_write.send(ControlMessage::Shutdown).unwrap();
