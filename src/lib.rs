@@ -44,9 +44,9 @@ type StreamId = usize;
 /// Produced by the incoming stream
 pub struct IncomingMessage<V> {
     /// Stream Id that the message if for
-    id: StreamId,
+    pub id: StreamId,
     /// Value received from a stream
-    value: V,
+    pub value: V,
 }
 
 impl<V> std::fmt::Debug for IncomingMessage<V> {
