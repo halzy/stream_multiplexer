@@ -22,6 +22,7 @@ Channels have their own backpressure that does not affect other channels.
 Incoming streams are by default set to channel 0 and can be moved to other channels via `ControlMessage`s.
 
 ```rust
+# use std::error::Error;
 use bytes::Bytes;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,10 +30,11 @@ use tokio::sync::mpsc;
 use stream_multiplexer::{Multiplexer, HalvesStream, ControlMessage, IncomingPacket, OutgoingPacket};
 use futures::stream::StreamExt;
 
+# fn main() -> Result<(), Box<dyn Error>> {
 # tokio::runtime::Builder::new().basic_scheduler().enable_all().build().unwrap().block_on(async move {
 // 3 channels of incoming streams, 0 is the channel that new streams join.
 // Backpressure is per channel. Streams can be moved between channels by
-// sending an OutgoingPackt::ChangeChannel message.
+// sending an OutgoingPacket::ChangeChannel message.
 let (channel0_tx, mut channel0_rx) = mpsc::channel(32);
 let (channel1_tx, mut channel1_rx) = mpsc::channel(32);
 let (channel2_tx, mut channel2_rx) = mpsc::channel(32);
@@ -50,9 +52,9 @@ let multiplexer = Multiplexer::new(
 );
 
 // Bind to a random port on localhost
-let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+let socket = TcpListener::bind("127.0.0.1:0").await?;
 
-let local_addr = socket.local_addr().unwrap();
+let local_addr = socket.local_addr()?;
 
 // Use the HalvesStream utility struct to map the stream of new sockets.
 // It will use LengthDelimitedCodec with 2 bytes as the packet size.
@@ -63,11 +65,11 @@ let (control_write, control_read) = mpsc::unbounded_channel();
 let mp_joinhandle = tokio::task::spawn(multiplexer.run(halves, control_read));
 
 // Make a test connection:
-let mut client = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+let mut client = tokio::net::TcpStream::connect(local_addr).await?;
 
 // Send 'a message'
 let mut data = Bytes::from("\x00\x09a message");
-client.write_buf(&mut data).await.unwrap();
+client.write_buf(&mut data).await?;
 client.flush();
 
 // Receive 'a message' on channel 0
@@ -84,12 +86,11 @@ assert_eq!(
 // Move the client to channel 1
 outgoing_tx
     .send(OutgoingPacket::ChangeChannel(vec![incoming_packet.id()], 1))
-    .await
-    .unwrap();
+    .await?;
 
 // Send 'a message' again, on channel 1 this time.
 let mut data = Bytes::from("\x00\x09a message");
-client.write_buf(&mut data).await.unwrap();
+client.write_buf(&mut data).await?;
 client.flush();
 
 // Receive 'a message' on channel 1
@@ -106,12 +107,11 @@ assert_eq!(
 // Move the client to channel 2
 outgoing_tx
     .send(OutgoingPacket::ChangeChannel(vec![incoming_packet.id()], 2))
-    .await
-    .unwrap();
+    .await?;
 
 // Send 'a message' again, on channel 2 this time.
 let mut data = Bytes::from("\x00\x09a message");
-client.write_buf(&mut data).await.unwrap();
+client.write_buf(&mut data).await?;
 client.flush();
 
 // Receive 'a message' on channel 2
@@ -125,11 +125,14 @@ assert_eq!(
     &Bytes::from("a message")
 );
 
-// Tell multiplexer te shut down
-control_write.send(ControlMessage::Shutdown).unwrap();
+// Tell multiplexer to shut down
+control_write.send(ControlMessage::Shutdown)?;
 
 mp_joinhandle.await.unwrap();
+# Ok::<_, Box<dyn Error>>(())
 # });
+# Ok(())
+# }
 ```
 */
 mod error;
