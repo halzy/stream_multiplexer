@@ -260,7 +260,7 @@ mod tests {
 
     #[tokio::test(basic_scheduler)]
     async fn send_message_and_shutdown() {
-        // crate::tests::init_logging();
+        //crate::tests::init_logging();
 
         // Set up a teest incrementer
         let id_gen = IncrementIdGen::default();
