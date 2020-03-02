@@ -160,7 +160,7 @@ type StreamId = usize;
 /// Produced by the incoming stream
 pub struct IncomingMessage<V> {
     /// Stream Id that the message if for
-    pub id: StreamId,
+    pub stream_id: StreamId,
 
     /// Value received from a stream
     pub value: V,
@@ -169,14 +169,14 @@ pub struct IncomingMessage<V> {
 impl<V> std::fmt::Debug for IncomingMessage<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncomingMessage")
-            .field("id", &self.id)
+            .field("id", &self.stream_id)
             .finish()
     }
 }
 
 impl<V> IncomingMessage<V> {
-    pub(crate) fn new(id: StreamId, value: V) -> Self {
-        Self { id, value }
+    pub(crate) fn new(stream_id: StreamId, value: V) -> Self {
+        Self { stream_id, value }
     }
 }
 
@@ -193,8 +193,8 @@ impl<V> IncomingPacket<V> {
     /// Return the ID of the stream that the packet represents.
     pub fn id(&self) -> StreamId {
         match self {
-            IncomingPacket::Message(IncomingMessage { id, .. }) => *id,
-            IncomingPacket::Linkdead(id) => *id,
+            IncomingPacket::Message(IncomingMessage { stream_id, .. }) => *stream_id,
+            IncomingPacket::Linkdead(stream_id) => *stream_id,
         }
     }
 
@@ -226,20 +226,20 @@ impl<V> std::fmt::Debug for IncomingPacket<V> {
 /// The payload of an OutgoingPacket
 #[derive(Clone)]
 pub struct OutgoingMessage<V> {
-    ids: Vec<StreamId>,
+    stream_ids: Vec<StreamId>,
     value: V,
 }
 impl<V> OutgoingMessage<V> {
     /// Creates a new message that is to be delivered to streams with `ids`.
-    pub fn new(ids: Vec<StreamId>, value: V) -> Self {
-        Self { ids, value }
+    pub fn new(stream_ids: Vec<StreamId>, value: V) -> Self {
+        Self { stream_ids, value }
     }
 }
 
 impl<V> std::fmt::Debug for OutgoingMessage<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutgoingMessage")
-            .field("ids", &self.ids)
+            .field("ids", &self.stream_ids)
             .finish()
     }
 }
