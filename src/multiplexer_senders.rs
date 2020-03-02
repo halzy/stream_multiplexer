@@ -139,7 +139,7 @@ where
     }
 
     fn handle_new_message(&mut self, message: OutgoingMessage<Item>) {
-        for stream_id in message.ids {
+        for stream_id in message.stream_ids {
             match self.sender_pairs.entry(stream_id) {
                 Entry::Vacant(_) => {
                     tracing::warn!(stream_id, "Tring to send message to non-existent stream.");
