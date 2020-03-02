@@ -228,17 +228,18 @@ impl<V> std::fmt::Debug for IncomingPacket<V> {
 /// The payload of an OutgoingPacket
 #[derive(Clone)]
 pub struct OutgoingMessage<V> {
-    stream_ids: Vec<StreamId>,
-    value: tinyvec::TinyVec<[Option<V>; 16]>,
+    stream_ids: tinyvec::TinyVec<[Option<StreamId>; 16]>,
+    values: tinyvec::TinyVec<[Option<V>; 16]>,
 }
 impl<V> OutgoingMessage<V> {
     /// Creates a new message that is to be delivered to streams with `ids`.
-    pub fn new(stream_ids: Vec<StreamId>, values: impl IntoIterator<Item = V>) -> Self {
+    pub fn new(
+        stream_ids: impl IntoIterator<Item = StreamId>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let stream_ids = tinyvec::TinyVec::from_iter(stream_ids.into_iter().map(Some));
         let values = tinyvec::TinyVec::from_iter(values.into_iter().map(Some));
-        Self {
-            stream_ids,
-            value: values,
-        }
+        Self { stream_ids, values }
     }
 }
 

@@ -139,14 +139,14 @@ where
     }
 
     fn handle_new_message(&mut self, mut message: OutgoingMessage<Item>) {
-        for stream_id in message.stream_ids {
+        for stream_id in message.stream_ids.iter().cloned().flatten() {
             match self.sender_pairs.entry(stream_id) {
                 Entry::Vacant(_) => {
                     tracing::warn!(stream_id, "Tring to send message to non-existent stream.");
                 }
                 Entry::Occupied(mut sender_pair_entry) => {
                     let mut should_remove = false;
-                    for value in message.value.drain(..).flatten() {
+                    for value in message.values.drain(..).flatten() {
                         let sender_pair = sender_pair_entry.get_mut();
                         match sender_pair.try_send(value.clone()) {
                             Ok(()) => {
