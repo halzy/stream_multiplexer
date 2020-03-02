@@ -138,30 +138,41 @@ where
         (futures_len, sender_pairs_len)
     }
 
-    fn handle_new_message(&mut self, message: OutgoingMessage<Item>) {
+    fn handle_new_message(&mut self, mut message: OutgoingMessage<Item>) {
         for stream_id in message.stream_ids {
             match self.sender_pairs.entry(stream_id) {
                 Entry::Vacant(_) => {
                     tracing::warn!(stream_id, "Tring to send message to non-existent stream.");
                 }
                 Entry::Occupied(mut sender_pair_entry) => {
-                    let sender_pair = sender_pair_entry.get_mut();
-                    match sender_pair.try_send(message.value.clone()) {
-                        Ok(()) => {
-                            // Enqueue the message and move the sender into the FuturesUnordered
-                            tracing::trace!(stream_id, "Enqueued message.");
-                            if let Some(sender) = sender_pair.take() {
-                                self.senders_stream.push(sender.into_future());
+                    let mut should_remove = false;
+                    for value in message.value.drain(..).flatten() {
+                        let sender_pair = sender_pair_entry.get_mut();
+                        match sender_pair.try_send(value.clone()) {
+                            Ok(()) => {
+                                // Enqueue the message and move the sender into the FuturesUnordered
+                                tracing::trace!(stream_id, "Enqueued message.");
+                                if let Some(sender) = sender_pair.take() {
+                                    self.senders_stream.push(sender.into_future());
+                                }
                             }
-                        }
-                        Err(TrySendError::Full(_)) => {
-                            tracing::error!(stream_id, "Stream is full, shutting down sender.");
-                            sender_pair_entry.remove_entry();
-                        }
-                        Err(TrySendError::Closed(_)) => {
-                            tracing::error!(stream_id, "Stream is closed, shutting down sender.");
-                            sender_pair_entry.remove_entry();
-                        }
+                            Err(TrySendError::Full(_)) => {
+                                tracing::error!(stream_id, "Stream is full, shutting down sender.");
+                                should_remove = true;
+                                break;
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                tracing::error!(
+                                    stream_id,
+                                    "Stream is closed, shutting down sender."
+                                );
+                                should_remove = true;
+                                break;
+                            }
+                        };
+                    }
+                    if should_remove {
+                        sender_pair_entry.remove_entry();
                     }
                 }
             };
@@ -298,7 +309,7 @@ mod tests {
 
         // Send some data to the stream
         for x in 0_u8..10 {
-            let message = OutgoingMessage::new(vec![stream_id], x);
+            let message = OutgoingMessage::new(vec![stream_id], vec![x]);
             message_channel.send(message).unwrap();
         }
 

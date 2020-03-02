@@ -155,6 +155,8 @@ use send_all_own::*;
 use sender::*;
 use stream_mover::*;
 
+use std::iter::FromIterator;
+
 type StreamId = usize;
 
 /// Produced by the incoming stream
@@ -227,12 +229,16 @@ impl<V> std::fmt::Debug for IncomingPacket<V> {
 #[derive(Clone)]
 pub struct OutgoingMessage<V> {
     stream_ids: Vec<StreamId>,
-    value: V,
+    value: tinyvec::TinyVec<[Option<V>; 16]>,
 }
 impl<V> OutgoingMessage<V> {
     /// Creates a new message that is to be delivered to streams with `ids`.
-    pub fn new(stream_ids: Vec<StreamId>, value: V) -> Self {
-        Self { stream_ids, value }
+    pub fn new(stream_ids: Vec<StreamId>, values: impl IntoIterator<Item = V>) -> Self {
+        let values = tinyvec::TinyVec::from_iter(values.into_iter().map(Some));
+        Self {
+            stream_ids,
+            value: values,
+        }
     }
 }
 
