@@ -135,7 +135,7 @@ async fn write_packets() {
     // send a message
     let data = Bytes::from("a message");
     data_write
-        .send(OutgoingMessage::new(vec![client1_id], data.clone()).into())
+        .send(OutgoingMessage::new(vec![client1_id], vec![data.clone()]).into())
         .unwrap();
 
     let mut read_data = BytesMut::new();
@@ -250,7 +250,7 @@ async fn change_channel() {
     // send a message to the client (so that the client waits and we can change channels)
     let data = Bytes::from("a message from the server");
     data_write
-        .send(OutgoingMessage::new(vec![client1_id], data.clone()).into())
+        .send(OutgoingMessage::new(vec![client1_id], vec![data.clone()]).into())
         .unwrap();
 
     // client reads data
