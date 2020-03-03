@@ -177,7 +177,8 @@ impl<V> std::fmt::Debug for IncomingMessage<V> {
 }
 
 impl<V> IncomingMessage<V> {
-    pub(crate) fn new(stream_id: StreamId, value: V) -> Self {
+    /// Creates a new IncomingMessage
+    pub fn new(stream_id: StreamId, value: V) -> Self {
         Self { stream_id, value }
     }
 }
