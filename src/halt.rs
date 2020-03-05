@@ -79,8 +79,8 @@ where
         }
     }
 
-    pub(crate) fn stream_id(&self) -> StreamId {
-        self.stream_id.expect("Should have stream ID")
+    pub(crate) fn stream_id(&self) -> Option<StreamId> {
+        self.stream_id
     }
 }
 
@@ -119,16 +119,21 @@ where
             // branches.
             tracing::trace!("self.read.poll_read()");
             let value = futures::ready!(Pin::new(&mut self.read.as_mut().unwrap()).poll_next(ctx));
+            let stream_id = self
+                .stream_id()
+                .expect("Should exist. It just disconnected or received a message");
             match value {
                 Some(value) => {
-                    let message = IncomingMessage::new(self.stream_id(), value);
+                    let message = IncomingMessage::new(stream_id, value);
                     Poll::Ready(Some(IncomingPacket::Message(message)))
                 }
                 None => {
-                    // FIXME: test this
                     // Take the read out ouf the option to signal that the stream is done
                     let _ = self.shutdown();
-                    Poll::Ready(Some(IncomingPacket::Linkdead(self.stream_id())))
+                    Poll::Ready(Some(IncomingPacket::StreamDisconnected(
+                        stream_id,
+                        DisconnectReason::Graceful,
+                    )))
                 }
             }
         }

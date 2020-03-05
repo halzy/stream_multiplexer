@@ -53,6 +53,10 @@ impl<St> StreamMover<St>
 where
     St: Stream,
 {
+    pub(crate) fn stream(&self) -> Option<&St> {
+        self.stream.as_ref()
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     fn send_stream(&mut self) -> Poll<Option<St::Item>> {
         match self.stream {

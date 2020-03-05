@@ -85,6 +85,7 @@ impl<Item, Si, Id> std::fmt::Debug for MultiplexerSenders<Item, Si, Id> {
 impl<Item, Si, Id> MultiplexerSenders<Item, Si, Id>
 where
     Si: Sink<Item> + Unpin,
+    Si::Error: std::fmt::Debug,
     Id: IdGen,
     Item: Clone,
 {
@@ -157,11 +158,13 @@ where
                                 }
                             }
                             Err(TrySendError::Full(_)) => {
+                                // FIXME: Signal sender dropped
                                 tracing::error!(stream_id, "Stream is full, shutting down sender.");
                                 should_remove = true;
                                 break;
                             }
                             Err(TrySendError::Closed(_)) => {
+                                // FIXME: Signal sender dropped
                                 tracing::error!(
                                     stream_id,
                                     "Stream is closed, shutting down sender."
@@ -201,9 +204,10 @@ where
                     }
                 }
             }
-            (Some(Err(_err)), _sender) => {
-                tracing::error!("senders produced an error");
-                todo!();
+            (Some(Err(err)), sender) => {
+                // FIXME: Should we bubble error information up?
+                tracing::error!(?err, "Senders produced an error. Dropping it.");
+                drop(sender);
             }
             (None, _sender) => todo!(),
         }
