@@ -67,6 +67,10 @@ let mp_joinhandle = tokio::task::spawn(multiplexer.run(halves, control_read));
 // Make a test connection:
 let mut client = tokio::net::TcpStream::connect(local_addr).await?;
 
+// Listen for the channel join announcement
+let message = channel0_rx.recv().await.expect("Should have connected.");
+matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
+
 // Send 'a message'
 let mut data = Bytes::from("\x00\x09a message");
 client.write_buf(&mut data).await?;
@@ -88,6 +92,10 @@ outgoing_tx
     .send(OutgoingPacket::ChangeChannel(vec![incoming_packet.id()], 1))
     .await?;
 
+// Listen for the channel join announcement
+let message = channel1_rx.recv().await.expect("Should have connected.");
+matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
+
 // Send 'a message' again, on channel 1 this time.
 let mut data = Bytes::from("\x00\x09a message");
 client.write_buf(&mut data).await?;
@@ -108,6 +116,10 @@ assert_eq!(
 outgoing_tx
     .send(OutgoingPacket::ChangeChannel(vec![incoming_packet.id()], 2))
     .await?;
+
+// Listen for the channel join announcement
+let message = channel2_rx.recv().await.expect("Should have connected.");
+matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
 
 // Send 'a message' again, on channel 2 this time.
 let mut data = Bytes::from("\x00\x09a message");
@@ -158,6 +170,7 @@ use stream_mover::*;
 use std::iter::FromIterator;
 
 type StreamId = usize;
+type ChannelId = usize;
 
 /// Produced by the incoming stream
 pub struct IncomingMessage<V> {
@@ -183,10 +196,23 @@ impl<V> IncomingMessage<V> {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Debug)]
+/// The reason why a stream was removed from a channel.
+pub enum DisconnectReason {
+    /// Stream client disconnected.
+    Graceful,
+
+    /// Stream was moved into the given channel.
+    ChannelChange(ChannelId),
+}
+
 /// A packet representing a message from a stream.
 pub enum IncomingPacket<V> {
-    /// The stream with ID has gone linkdead.
-    Linkdead(StreamId),
+    /// A new stream has connected to the channel.
+    StreamConnected(StreamId),
+
+    /// Stream has been removed from the channel.
+    StreamDisconnected(StreamId, DisconnectReason),
 
     /// The stream has produced a message.
     Message(IncomingMessage<V>),
@@ -197,7 +223,8 @@ impl<V> IncomingPacket<V> {
     pub fn id(&self) -> StreamId {
         match self {
             IncomingPacket::Message(IncomingMessage { stream_id, .. }) => *stream_id,
-            IncomingPacket::Linkdead(stream_id) => *stream_id,
+            IncomingPacket::StreamConnected(stream_id) => *stream_id,
+            IncomingPacket::StreamDisconnected(stream_id, _) => *stream_id,
         }
     }
 
@@ -218,7 +245,12 @@ impl<V> From<IncomingMessage<V>> for IncomingPacket<V> {
 impl<V> std::fmt::Debug for IncomingPacket<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IncomingPacket::Linkdead(id) => write!(f, "IncomingPacket::Linkdead({})", id),
+            IncomingPacket::StreamConnected(id) => {
+                write!(f, "IncomingPacket::StreamConnected({})", id)
+            }
+            IncomingPacket::StreamDisconnected(id, reason) => {
+                write!(f, "IncomingPacket::StreamDisonnected({}, {:?})", id, reason)
+            }
             IncomingPacket::Message(message) => {
                 write!(f, "IncomingPacket::IncomingMessage({:?})", &message)
             }
@@ -259,7 +291,7 @@ pub enum OutgoingPacket<V> {
     Message(OutgoingMessage<V>),
 
     /// Change change of stream_id to channel_id.
-    ChangeChannel(Vec<StreamId>, usize),
+    ChangeChannel(Vec<StreamId>, ChannelId),
 
     /// Shutdown the stream
     Shutdown(Vec<StreamId>),

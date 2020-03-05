@@ -174,6 +174,9 @@ async fn read_packets() {
     let client1_id = id_gen.wait_for_next_id().await;
     assert_eq!(1, client1_id);
 
+    let message = in_data_rx.recv().await.expect("Should have connected.");
+    matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
+
     for _ in 0_u8..2 {
         // send a message
         let mut data = Bytes::from("\0\ta message");
@@ -194,6 +197,13 @@ async fn read_packets() {
 
     // cleanup
     client1.shutdown(std::net::Shutdown::Both).unwrap();
+
+    let message = in_data_rx.recv().await.expect("Should have connected.");
+    matches::assert_matches!(
+        message,
+        IncomingPacket::StreamDisconnected(_, DisconnectReason::Graceful)
+    );
+
     control_write.send(ControlMessage::Shutdown).unwrap();
 
     assert!(shutdown_status.await.is_ok());
@@ -227,6 +237,9 @@ async fn change_channel() {
 
     assert_eq!(client1_id, 101);
 
+    let message = in_data_rx0.recv().await.expect("Should have connected.");
+    matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
+
     // send a message on channel 0
     let mut data = Bytes::from("\0\ta message");
     client1.write_buf(&mut data).await.unwrap();
@@ -246,6 +259,15 @@ async fn change_channel() {
     // Switch client1 from channel 0 to channel 1
     let change_channel = OutgoingPacket::ChangeChannel(vec![client1_id], 1);
     data_write.send(change_channel).unwrap();
+
+    let message = in_data_rx0.recv().await.expect("Should have disconnected.");
+    matches::assert_matches!(
+        message,
+        IncomingPacket::StreamDisconnected(_, DisconnectReason::ChannelChange(1))
+    );
+
+    let message = in_data_rx1.recv().await.expect("Should have connected.");
+    matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
 
     // send a message to the client (so that the client waits and we can change channels)
     let data = Bytes::from("a message from the server");
@@ -305,13 +327,19 @@ async fn linkdead() {
     let client1_id = id_gen.wait_for_next_id().await;
     assert_eq!(1, client1_id);
 
+    let message = in_data_rx.recv().await.expect("Should have connected.");
+    matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
+
     // cleanup
     client1.shutdown(std::net::Shutdown::Both).unwrap();
 
     // Validate that a linkdead packet is sent.
     let message = in_data_rx.recv().await.expect("should have gone linkdead");
     assert_eq!(client1_id, message.id());
-    matches::assert_matches!(message, IncomingPacket::Linkdead(_));
+    matches::assert_matches!(
+        message,
+        IncomingPacket::StreamDisconnected(_, DisconnectReason::Graceful)
+    );
 
     // Stop multiplexer
     control_write.send(ControlMessage::Shutdown).unwrap();

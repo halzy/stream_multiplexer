@@ -10,10 +10,11 @@ use std::io::Result as IoResult;
 
 type IncomingPacketReader<ReadSt> = HaltAsyncRead<ReadSt>;
 type IncomingPacketReaderTx<ReadSt> =
-    mpsc::UnboundedSender<(usize, StreamMover<IncomingPacketReader<ReadSt>>)>;
+    mpsc::UnboundedSender<(ChannelId, StreamMover<IncomingPacketReader<ReadSt>>)>;
 type StreamMovers<ReadSt> = HashMap<
     StreamId,
     (
+        ChannelId, // Channel that they are in
         StreamMoverControl,
         oneshot::Receiver<IncomingPacketReader<ReadSt>>,
     ),
@@ -31,7 +32,7 @@ where
     readers: Option<Vec<SelectAll<StreamMover<IncomingPacketReader<ReadSt>>>>>,
     senders: Option<MultiplexerSenders<Item, WriteSi, Id>>,
     outgoing: OutSt,
-    incoming_packet_sinks: Option<Vec<mpsc::Sender<IncomingPacket<ReadSt::Item>>>>,
+    incoming_packet_sinks: Vec<mpsc::Sender<IncomingPacket<ReadSt::Item>>>,
     stream_movers: StreamMovers<ReadSt>,
     senders_channel: mpsc::UnboundedSender<(Sender<WriteSi>, oneshot::Sender<StreamId>)>,
     messages_channel: mpsc::UnboundedSender<OutgoingMessage<Item>>,
@@ -103,7 +104,7 @@ where
             senders: Some(senders),
             outgoing,
             readers: Some(readers),
-            incoming_packet_sinks: Some(incoming_packet_sinks),
+            incoming_packet_sinks,
             stream_movers,
             senders_channel,
             messages_channel,
@@ -119,7 +120,7 @@ where
     async fn change_channel(
         &mut self,
         ids: Vec<StreamId>,
-        channel: usize,
+        channel: ChannelId,
         incoming_packet_reader_tx: &mut IncomingPacketReaderTx<ReadSt>,
     ) {
         tracing::trace!(?ids, ?channel, "change channel");
@@ -129,13 +130,27 @@ where
                 None => {
                     tracing::error!(id, "was not in stream_movers");
                 }
-                Some((control, receiver)) => {
+                Some((channel_id, control, receiver)) => {
                     // Signal so that it moves the PacketReader to us
                     control.signal();
 
                     // wait for the oneshot to receive the PacketReader
                     match receiver.await {
                         Ok(packet_reader) => {
+                            // Let the current stream know that the packet has left.
+                            let packet_leave = IncomingPacket::StreamDisconnected(
+                                id,
+                                DisconnectReason::ChannelChange(channel),
+                            );
+                            if let Err(err) = self.incoming_packet_sinks[channel_id]
+                                .send(packet_leave)
+                                .await
+                            {
+                                tracing::error!(?err, "Could not send out stream disconnect.");
+                                return;
+                            }
+
+                            // Send the stream into the change channel queue
                             self.enqueue_packet_reader(
                                 id,
                                 channel,
@@ -155,7 +170,7 @@ where
     fn enqueue_packet_reader(
         &mut self,
         stream_id: StreamId,
-        channel: usize,
+        channel: ChannelId,
         reader: IncomingPacketReader<ReadSt>,
         incoming_packet_reader_tx: &mut IncomingPacketReaderTx<ReadSt>,
     ) {
@@ -167,7 +182,7 @@ where
         tracing::trace!(stream_id, channel, "inserting into stream_movers");
         if self
             .stream_movers
-            .insert(stream_id, (control, move_stream_rx))
+            .insert(stream_id, (channel, control, move_stream_rx))
             .is_some()
         {
             tracing::error!(stream_id, "was already in the stream_movers");
@@ -219,7 +234,7 @@ where
     ///
     /// If there is backpressure, joining the channel also slows.
     fn run_channel(
-        channel: usize,
+        channel: ChannelId,
         mut reader: SelectAll<StreamMover<IncomingPacketReader<ReadSt>>>,
         mut incoming_packet_sink: mpsc::Sender<IncomingPacket<ReadSt::Item>>,
         mut incoming_packet_reader_rx: mpsc::UnboundedReceiver<
@@ -234,6 +249,12 @@ where
                         tracing::trace!("incoming socket (none)");
                         match packet_reader {
                             Some(packet_reader) => {
+                                let stream_id = packet_reader.stream().expect("Stream is moving channels, should exist.").stream_id().unwrap();
+                                let join_packet = IncomingPacket::StreamConnected(stream_id);
+                                if let Err(_) = incoming_packet_sink.send(join_packet).await {
+                                    tracing::error!("Could not send channel join. Shutting down receive loop");
+                                    return;
+                                }
                                 reader.push(packet_reader);
                             }
                             None => {
@@ -248,7 +269,7 @@ where
                             Some(packet) => {
                                 tracing::trace!(channel, "sending data");
                                 if let Err(_) = incoming_packet_sink.send(packet).await {
-                                    tracing::error!("Shutting down receive loop");
+                                    tracing::error!("Could not proxy channel data. Shutting down receive loop");
                                     return;
                                 }
                             }
@@ -269,6 +290,7 @@ where
     OutSt: Stream<Item = OutgoingPacket<Item>>,
     ReadSt: Stream,
     WriteSi: Sink<Item>,
+    WriteSi::Error: std::fmt::Debug,
 
     Id: Send + Unpin + 'static,
     Item: Clone + Send + Sync + 'static,
@@ -293,17 +315,13 @@ where
         tracing::info!("Waiting for connections");
 
         let mut readers = self.readers.take().expect("Should have readers!");
-        let mut incoming_packet_sinks = self
-            .incoming_packet_sinks
-            .take()
-            .expect("Should have incoming_packet_sinks!");
 
-        let channel_count = incoming_packet_sinks.len();
+        let channel_count = self.incoming_packet_sinks.len();
         let mut incoming_packet_readers_tx = Vec::with_capacity(channel_count);
 
         for channel in 0..channel_count {
             let reader = readers.remove(0);
-            let incoming_packet_sink = incoming_packet_sinks.remove(0);
+            let incoming_packet_sink = self.incoming_packet_sinks[channel].clone();
 
             let (incoming_packet_reader_tx, incoming_packet_reader_rx) = mpsc::unbounded_channel();
             incoming_packet_readers_tx.push(incoming_packet_reader_tx);
