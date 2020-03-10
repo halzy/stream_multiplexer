@@ -184,7 +184,7 @@ pub struct IncomingMessage<V> {
 impl<V> std::fmt::Debug for IncomingMessage<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncomingMessage")
-            .field("id", &self.stream_id)
+            .field("stream_id", &self.stream_id)
             .finish()
     }
 }

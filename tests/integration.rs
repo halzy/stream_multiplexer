@@ -306,6 +306,7 @@ async fn change_channel() {
 #[tokio::test(basic_scheduler)]
 async fn linkdead() {
     // init_logging();
+
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
     let socket = TcpStreamProducer::new(socket);

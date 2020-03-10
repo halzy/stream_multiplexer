@@ -1,7 +1,7 @@
 use crate::*;
 
 use futures::prelude::*;
-use futures::stream::{SelectAll, StreamExt};
+use futures::stream::{FuturesUnordered, StreamExt, StreamFuture};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -29,7 +29,7 @@ pub struct Multiplexer<Item, ReadSt, WriteSi, OutSt, Id = IncrementIdGen>
 where
     ReadSt: Stream,
 {
-    readers: Option<Vec<SelectAll<StreamMover<IncomingPacketReader<ReadSt>>>>>,
+    readers: Option<Vec<FuturesUnordered<StreamFuture<StreamMover<IncomingPacketReader<ReadSt>>>>>>,
     senders: Option<MultiplexerSenders<Item, WriteSi, Id>>,
     outgoing: OutSt,
     incoming_packet_sinks: Vec<mpsc::Sender<IncomingPacket<ReadSt::Item>>>,
@@ -95,7 +95,7 @@ where
 
         let readers = (0..incoming_packet_sinks.len())
             .into_iter()
-            .map(|_| SelectAll::new())
+            .map(|_| FuturesUnordered::new())
             .collect();
 
         let stream_movers = StreamMovers::default();
@@ -235,7 +235,7 @@ where
     /// If there is backpressure, joining the channel also slows.
     fn run_channel(
         channel: ChannelId,
-        mut reader: SelectAll<StreamMover<IncomingPacketReader<ReadSt>>>,
+        mut reader: FuturesUnordered<StreamFuture<StreamMover<IncomingPacketReader<ReadSt>>>>,
         mut incoming_packet_sink: mpsc::Sender<IncomingPacket<ReadSt::Item>>,
         mut incoming_packet_reader_rx: mpsc::UnboundedReceiver<
             StreamMover<IncomingPacketReader<ReadSt>>,
@@ -246,16 +246,25 @@ where
                 tracing::trace!(channel, "incoming loop start");
                 tokio::select! {
                     packet_reader = incoming_packet_reader_rx.recv() => {
-                        tracing::trace!("incoming socket (none)");
+                        // There is a new stream to join this channel
                         match packet_reader {
                             Some(packet_reader) => {
-                                let stream_id = packet_reader.stream().expect("Stream is moving channels, should exist.").stream_id().unwrap();
+                                // Get the stream_id out of the packet_reader
+                                let stream_id = packet_reader
+                                    .stream()
+                                    .expect("Stream is moving channels, should exist.")
+                                    .stream_id()
+                                    .unwrap();
+
+
+                                // Announce that the stream is joining this channel
                                 let join_packet = IncomingPacket::StreamConnected(stream_id);
                                 if let Err(_) = incoming_packet_sink.send(join_packet).await {
                                     tracing::error!("Could not send channel join. Shutting down receive loop");
                                     return;
                                 }
-                                reader.push(packet_reader);
+
+                                reader.push(packet_reader.into_future());
                             }
                             None => {
                                 tracing::error!("incoming packet reader received None, exiting loop");
@@ -263,7 +272,10 @@ where
                             }
                         }
                     }
-                    packet_res = reader.next(), if !reader.is_empty() => {
+                    next_reader = reader.next(), if !reader.is_empty() => {
+                        let mut next_reader = next_reader;
+                        let (packet_res, packet_reader) = next_reader.take().expect("reader.next() is never called if it's empty");
+
                         tracing::trace!("incoming data");
                         match packet_res {
                             Some(packet) => {
@@ -272,8 +284,10 @@ where
                                     tracing::error!("Could not proxy channel data. Shutting down receive loop");
                                     return;
                                 }
+                                reader.push(packet_reader.into_future());
                             }
                             None => {
+                                // Dropping packet reader, stream is done
                                 tracing::error!("incoming reader received None");
                             }
                         }
@@ -402,4 +416,3 @@ where
         })
     }
 }
-
