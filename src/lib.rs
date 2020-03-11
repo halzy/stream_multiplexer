@@ -10,10 +10,6 @@
     unused_import_braces,
     unused_qualifications
 )]
-/* FIXME
-#![cfg_attr(debug_assertions, allow(dead_code))]
-#![cfg_attr(test, allow(dead_code))]
-*/
 /*!
 This crate provides stream multiplexing with channels.
 
@@ -296,6 +292,30 @@ pub enum OutgoingPacket<V> {
     /// Shutdown the stream
     Shutdown(Vec<StreamId>),
 }
+
+impl<V> OutgoingPacket<V> {
+    /// Return the ID of the stream that the packet represents.
+    pub fn stream_ids(&self) -> Vec<StreamId> {
+        match self {
+            OutgoingPacket::Message(OutgoingMessage { stream_ids, .. }) => {
+                stream_ids.iter().filter_map(|v| *v).collect()
+            }
+            OutgoingPacket::ChangeChannel(stream_ids, _) => stream_ids.clone(),
+            OutgoingPacket::Shutdown(stream_ids) => stream_ids.clone(),
+        }
+    }
+
+    /// If there is a value, return a reference to it
+    pub fn values(&self) -> Option<impl Iterator<Item = &V>> {
+        match self {
+            OutgoingPacket::Message(OutgoingMessage { values, .. }) => {
+                Some(values.iter().filter_map(|v| v.as_ref()))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl<V> std::fmt::Debug for OutgoingPacket<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
