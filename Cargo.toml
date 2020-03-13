@@ -1,6 +1,6 @@
 [package]
 name = "stream_multiplexer"
-version = "0.9.3"
+version = "0.10.0"
 authors = ["Benjamin Halsted <bhalsted@gmail.com>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
