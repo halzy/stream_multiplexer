@@ -22,6 +22,7 @@ tokio-util = { version = "0.2", features = ["codec"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-futures = "0.2"
 tinyvec = { version = "0.3", features = ["alloc"] }
+either = "1.5.3"
 
 [dev-dependencies]
 futures = { version = "0.3", default-features = false, features = ["alloc","std"] }

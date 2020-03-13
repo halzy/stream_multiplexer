@@ -149,6 +149,7 @@ mod halves_stream;
 mod id_gen;
 mod multiplexer;
 mod multiplexer_senders;
+mod packets;
 mod send_all_own;
 mod sender;
 mod stream_mover;
@@ -159,180 +160,13 @@ pub use halves_stream::*;
 pub use id_gen::*;
 pub use multiplexer::*;
 use multiplexer_senders::*;
+pub use packets::*;
 use send_all_own::*;
 use sender::*;
 use stream_mover::*;
 
-use std::iter::FromIterator;
-
 type StreamId = usize;
 type ChannelId = usize;
-
-/// Produced by the incoming stream
-pub struct IncomingMessage<V> {
-    /// Stream Id that the message if for
-    pub stream_id: StreamId,
-
-    /// Value received from a stream
-    pub value: V,
-}
-
-impl<V> std::fmt::Debug for IncomingMessage<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IncomingMessage")
-            .field("stream_id", &self.stream_id)
-            .finish()
-    }
-}
-
-impl<V> IncomingMessage<V> {
-    /// Creates a new IncomingMessage
-    pub fn new(stream_id: StreamId, value: V) -> Self {
-        Self { stream_id, value }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Debug)]
-/// The reason why a stream was removed from a channel.
-pub enum DisconnectReason {
-    /// Stream client disconnected.
-    Graceful,
-
-    /// Stream was moved into the given channel.
-    ChannelChange(ChannelId),
-}
-
-/// A packet representing a message from a stream.
-pub enum IncomingPacket<V> {
-    /// A new stream has connected to the channel.
-    StreamConnected(StreamId),
-
-    /// Stream has been removed from the channel.
-    StreamDisconnected(StreamId, DisconnectReason),
-
-    /// The stream has produced a message.
-    Message(IncomingMessage<V>),
-}
-
-impl<V> IncomingPacket<V> {
-    /// Return the ID of the stream that the packet represents.
-    pub fn id(&self) -> StreamId {
-        match self {
-            IncomingPacket::Message(IncomingMessage { stream_id, .. }) => *stream_id,
-            IncomingPacket::StreamConnected(stream_id) => *stream_id,
-            IncomingPacket::StreamDisconnected(stream_id, _) => *stream_id,
-        }
-    }
-
-    /// If there is a value, return a reference to it
-    pub fn value(&self) -> Option<&V> {
-        match self {
-            IncomingPacket::Message(IncomingMessage { value, .. }) => Some(value),
-            _ => None,
-        }
-    }
-}
-impl<V> From<IncomingMessage<V>> for IncomingPacket<V> {
-    fn from(message: IncomingMessage<V>) -> Self {
-        Self::Message(message)
-    }
-}
-
-impl<V> std::fmt::Debug for IncomingPacket<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IncomingPacket::StreamConnected(id) => {
-                write!(f, "IncomingPacket::StreamConnected({})", id)
-            }
-            IncomingPacket::StreamDisconnected(id, reason) => {
-                write!(f, "IncomingPacket::StreamDisonnected({}, {:?})", id, reason)
-            }
-            IncomingPacket::Message(message) => {
-                write!(f, "IncomingPacket::IncomingMessage({:?})", &message)
-            }
-        }
-    }
-}
-
-/// The payload of an OutgoingPacket
-#[derive(Clone)]
-pub struct OutgoingMessage<V> {
-    stream_ids: tinyvec::TinyVec<[Option<StreamId>; 16]>,
-    values: tinyvec::TinyVec<[Option<V>; 16]>,
-}
-impl<V> OutgoingMessage<V> {
-    /// Creates a new message that is to be delivered to streams with `ids`.
-    pub fn new(
-        stream_ids: impl IntoIterator<Item = StreamId>,
-        values: impl IntoIterator<Item = V>,
-    ) -> Self {
-        let stream_ids = tinyvec::TinyVec::from_iter(stream_ids.into_iter().map(Some));
-        let values = tinyvec::TinyVec::from_iter(values.into_iter().map(Some));
-        Self { stream_ids, values }
-    }
-}
-
-impl<V> std::fmt::Debug for OutgoingMessage<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutgoingMessage")
-            .field("ids", &self.stream_ids)
-            .finish()
-    }
-}
-impl<V> Unpin for OutgoingMessage<V> where V: Unpin {}
-
-/// For sending a message or causing the stream to change to a different channel
-pub enum OutgoingPacket<V> {
-    /// Message to send to the stream
-    Message(OutgoingMessage<V>),
-
-    /// Change change of stream_id to channel_id.
-    ChangeChannel(Vec<StreamId>, ChannelId),
-
-    /// Shutdown the stream
-    Shutdown(Vec<StreamId>),
-}
-
-impl<V> OutgoingPacket<V> {
-    /// Return the ID of the stream that the packet represents.
-    pub fn stream_ids(&self) -> Vec<StreamId> {
-        match self {
-            OutgoingPacket::Message(OutgoingMessage { stream_ids, .. }) => {
-                stream_ids.iter().filter_map(|v| *v).collect()
-            }
-            OutgoingPacket::ChangeChannel(stream_ids, _) => stream_ids.clone(),
-            OutgoingPacket::Shutdown(stream_ids) => stream_ids.clone(),
-        }
-    }
-
-    /// If there is a value, return a reference to it
-    pub fn values(&self) -> Option<impl Iterator<Item = &V>> {
-        match self {
-            OutgoingPacket::Message(OutgoingMessage { values, .. }) => {
-                Some(values.iter().filter_map(|v| v.as_ref()))
-            }
-            _ => None,
-        }
-    }
-}
-
-impl<V> std::fmt::Debug for OutgoingPacket<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OutgoingPacket::Message(message) => write!(f, "OutgoingPacket::Message({:?})", message),
-            OutgoingPacket::ChangeChannel(ids, channel) => {
-                write!(f, "OutgoingPacket::ChangeChannel({:?}, {})", ids, channel)
-            }
-            OutgoingPacket::Shutdown(ids) => write!(f, "OutgoingPacket::Shutdown({:?})", ids),
-        }
-    }
-}
-
-impl<V> From<OutgoingMessage<V>> for OutgoingPacket<V> {
-    fn from(message: OutgoingMessage<V>) -> Self {
-        Self::Message(message)
-    }
-}
 
 /// To control the multiplexer, `ControlMessage` can be sent to the `control` channel passed into
 /// `Multiplexer.run()`
