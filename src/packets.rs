@@ -4,20 +4,13 @@ use either::Either;
 use std::iter::FromIterator;
 
 /// Produced by the incoming stream
+#[derive(Clone, PartialEq, Debug)]
 pub struct IncomingMessage<V> {
     /// Stream Id that the message if for
     pub stream_id: StreamId,
 
     /// Value received from a stream
     pub value: V,
-}
-
-impl<V> std::fmt::Debug for IncomingMessage<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IncomingMessage")
-            .field("stream_id", &self.stream_id)
-            .finish()
-    }
 }
 
 impl<V> IncomingMessage<V> {
@@ -38,6 +31,7 @@ pub enum DisconnectReason {
 }
 
 /// A packet representing a message from a stream.
+#[derive(Clone, PartialEq, Debug)]
 pub enum IncomingPacket<V> {
     /// A new stream has connected to the channel.
     StreamConnected(StreamId),
@@ -73,24 +67,8 @@ impl<V> From<IncomingMessage<V>> for IncomingPacket<V> {
     }
 }
 
-impl<V> std::fmt::Debug for IncomingPacket<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IncomingPacket::StreamConnected(id) => {
-                write!(f, "IncomingPacket::StreamConnected({})", id)
-            }
-            IncomingPacket::StreamDisconnected(id, reason) => {
-                write!(f, "IncomingPacket::StreamDisonnected({}, {:?})", id, reason)
-            }
-            IncomingPacket::Message(message) => {
-                write!(f, "IncomingPacket::IncomingMessage({:?})", &message)
-            }
-        }
-    }
-}
-
 /// The payload of an OutgoingPacket
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct OutgoingMessage<V> {
     pub(crate) stream_ids: tinyvec::TinyVec<[Option<StreamId>; 16]>,
     pub(crate) values: tinyvec::TinyVec<[Option<V>; 16]>,
@@ -107,16 +85,10 @@ impl<V> OutgoingMessage<V> {
     }
 }
 
-impl<V> std::fmt::Debug for OutgoingMessage<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutgoingMessage")
-            .field("ids", &self.stream_ids)
-            .finish()
-    }
-}
 impl<V> Unpin for OutgoingMessage<V> where V: Unpin {}
 
 /// For sending a message or causing the stream to change to a different channel
+#[derive(Clone, PartialEq, Debug)]
 pub enum OutgoingPacket<V> {
     /// Message to send to the stream
     Message(OutgoingMessage<V>),
@@ -221,18 +193,6 @@ impl<'a, V> DoubleEndedIterator for OptionSliceIter<'a, V> {
                 self.back_position -= 1;
                 Some(next)
             }
-        }
-    }
-}
-
-impl<V> std::fmt::Debug for OutgoingPacket<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OutgoingPacket::Message(message) => write!(f, "OutgoingPacket::Message({:?})", message),
-            OutgoingPacket::ChangeChannel(ids, channel) => {
-                write!(f, "OutgoingPacket::ChangeChannel({:?}, {})", ids, channel)
-            }
-            OutgoingPacket::Shutdown(ids) => write!(f, "OutgoingPacket::Shutdown({:?})", ids),
         }
     }
 }

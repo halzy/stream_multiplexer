@@ -115,7 +115,8 @@ where
 impl<Item, ReadSt, WriteSi, OutSt, Id> Multiplexer<Item, ReadSt, WriteSi, OutSt, Id>
 where
     ReadSt: Stream + Unpin,
-    Item: Clone,
+    ReadSt::Item: std::fmt::Debug,
+    Item: Clone + std::fmt::Debug,
 {
     async fn change_channel(
         &mut self,
@@ -307,10 +308,10 @@ where
     WriteSi::Error: std::fmt::Debug,
 
     Id: Send + Unpin + 'static,
-    Item: Clone + Send + Sync + 'static,
+    Item: Clone + Send + Sync + 'static + std::fmt::Debug,
     OutSt: Send + Unpin + 'static,
     ReadSt: Send + Unpin + 'static,
-    ReadSt::Item: Send,
+    ReadSt::Item: Send + std::fmt::Debug,
     WriteSi: Send + Unpin + 'static,
 {
     /// Start the multiplexer. Giving it a stream of incoming connection halves and a stream for
