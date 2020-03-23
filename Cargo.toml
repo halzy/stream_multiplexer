@@ -18,7 +18,9 @@ bytes = "0.5"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 thiserror = "1.0"
 tokio = { version = "0.2.13", features = ["full"] }
+#tokio = { path="../tokio/tokio", features = ["full"] }
 tokio-util = { version = "0.2", features = ["codec"] }
+#tokio-util = { path="../tokio/tokio-util", features = ["codec"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-futures = "0.2"
 tinyvec = { version = "0.3", features = ["alloc"] }
@@ -28,4 +30,7 @@ either = "1.5.3"
 futures = { version = "0.3", default-features = false, features = ["alloc","std"] }
 matches = "0.1"
 tokio = { version = "0.2.13", features = ["full", "test-util"] }
+#tokio = { path="../tokio/tokio", features = ["full", "test-util"] }
+tokio-test = "0.2.0"
+#tokio-test = { path="../tokio/tokio-test" }
 tracing-subscriber = "0.2"

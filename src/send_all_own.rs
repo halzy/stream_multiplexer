@@ -12,6 +12,7 @@ where
     sender: Sender<Si>,
     stream: Option<Fuse<St>>,
     buffered: Option<St::Item>,
+    should_flush: bool,
 }
 
 impl<Si, St> SendAllOwn<Si, St>
@@ -23,6 +24,7 @@ where
             sender,
             stream: Some(stream.fuse()),
             buffered: None,
+            should_flush: false,
         }
     }
 
@@ -44,7 +46,12 @@ where
         debug_assert!(self.buffered.is_none());
         match self.sender.sink() {
             Some(mut sink) => match Pin::new(&mut sink).poll_ready(cx)? {
-                Poll::Ready(()) => Poll::Ready(Pin::new(&mut sink).start_send(item)),
+                Poll::Ready(()) => {
+                    // We only want to flush if we have sent data
+                    self.should_flush = true;
+
+                    Poll::Ready(Pin::new(&mut sink).start_send(item))
+                }
                 Poll::Pending => {
                     self.buffered.replace(item);
                     Poll::Pending
@@ -90,14 +97,20 @@ where
                 Poll::Ready(None) => {
                     tracing::trace!("stream has None");
                     if let Some(mut sink) = this.sender.sink() {
-                        futures::ready!(Pin::new(&mut sink).poll_flush(cx))?;
+                        if this.should_flush {
+                            this.should_flush = false;
+                            futures::ready!(Pin::new(&mut sink).poll_flush(cx))?;
+                        }
                     }
                     return Poll::Ready(Some(Ok(())));
                 }
                 Poll::Pending => {
                     tracing::trace!("Stream is pending");
                     if let Some(mut sink) = this.sender.sink() {
-                        futures::ready!(Pin::new(&mut sink).poll_flush(cx))?;
+                        if this.should_flush {
+                            this.should_flush = false;
+                            futures::ready!(Pin::new(&mut sink).poll_flush(cx))?;
+                        }
                     }
                     return Poll::Ready(Some(Ok(())));
                     //return Poll::Pending;
