@@ -13,8 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc as channel;
 
-use std::io::Result as IoResult;
+use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone)]
 struct SharedIdGen<T: IdGen = IncrementIdGen> {
@@ -65,7 +66,7 @@ pub(crate) fn init_logging() {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }
 
-async fn bind() -> IoResult<TcpListener> {
+async fn bind() -> io::Result<TcpListener> {
     tracing::info!("Starting");
     let addrs = "127.0.0.1:0".to_string();
     tracing::info!("Binding {:?}", &addrs);
@@ -74,7 +75,7 @@ async fn bind() -> IoResult<TcpListener> {
 
 #[tokio::test(basic_scheduler)]
 async fn shutdown() {
-    let stream_halves = TcpStreamProducer::new(bind().await.unwrap());
+    let stream_halves = TestStreamProducer::new(bind().await.unwrap());
     let (control_write, control_read) = channel::unbounded_channel();
     let (_data_write, data_read) = channel::unbounded_channel();
     let (in_data_tx, _in_data_rx) = channel::channel(10);
@@ -89,7 +90,7 @@ async fn shutdown() {
 async fn socket_shutdown() {
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
-    let socket = TcpStreamProducer::new(socket);
+    let socket = TestStreamProducer::new(socket);
 
     let client = tokio::net::TcpStream::connect(local_addr).await.unwrap();
     client.shutdown(std::net::Shutdown::Both).unwrap();
@@ -110,7 +111,7 @@ async fn write_packets() {
 
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
-    let socket = TcpStreamProducer::new(socket);
+    let socket = TestStreamProducer::new(socket);
 
     // so that we can signal shutdown
     let (control_write, control_read) = channel::unbounded_channel();
@@ -155,7 +156,7 @@ async fn read_packets() {
     //init_logging();
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
-    let socket = TcpStreamProducer::new(socket);
+    let socket = TestStreamProducer::new(socket);
 
     // so that we can signal shutdown
     let (control_write, control_read) = channel::unbounded_channel();
@@ -201,7 +202,7 @@ async fn read_packets() {
     let message = in_data_rx.recv().await.expect("Should have connected.");
     matches::assert_matches!(
         message,
-        IncomingPacket::StreamDisconnected(_, DisconnectReason::Graceful)
+        IncomingPacket::StreamDisconnected(_, DisconnectReason::Linkdead)
     );
 
     control_write.send(ControlMessage::Shutdown).unwrap();
@@ -214,7 +215,7 @@ async fn change_channel() {
     // init_logging();
     let socket = bind().await.unwrap();
     let local_addr = socket.local_addr().unwrap();
-    let socket = TcpStreamProducer::new(socket);
+    let socket = TestStreamProducer::new(socket);
 
     // so that we can signal shutdown
     let (control_write, control_read) = channel::unbounded_channel();
@@ -304,12 +305,11 @@ async fn change_channel() {
 }
 
 #[tokio::test(basic_scheduler)]
-async fn linkdead() {
+async fn linkdead_via_teststream() {
     // init_logging();
 
-    let socket = bind().await.unwrap();
-    let local_addr = socket.local_addr().unwrap();
-    let socket = TcpStreamProducer::new(socket);
+    let (mut stream_producer, producer_rx) = channel::channel(2);
+    let socket = TestStreamProducer::new(producer_rx);
 
     // so that we can signal shutdown
     let (control_write, control_read) = channel::unbounded_channel();
@@ -324,22 +324,133 @@ async fn linkdead() {
     let shutdown_status = tokio::task::spawn(multiplexer.run(socket, control_read));
 
     // connect some clients so that we can send a message to them
-    let client1 = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+    let client1 = tokio_test::io::Builder::new().build();
+    stream_producer.send(Ok(client1)).await.unwrap();
     let client1_id = id_gen.wait_for_next_id().await;
     assert_eq!(1, client1_id);
 
     let message = in_data_rx.recv().await.expect("Should have connected.");
     matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
 
-    // cleanup
-    client1.shutdown(std::net::Shutdown::Both).unwrap();
-
     // Validate that a linkdead packet is sent.
+    // There were no packets in the mock it should be linkdead now.
     let message = in_data_rx.recv().await.expect("should have gone linkdead");
     assert_eq!(client1_id, message.id());
     matches::assert_matches!(
         message,
-        IncomingPacket::StreamDisconnected(_, DisconnectReason::Graceful)
+        IncomingPacket::StreamDisconnected(_, DisconnectReason::Linkdead)
+    );
+
+    // Stop multiplexer
+    control_write.send(ControlMessage::Shutdown).unwrap();
+
+    assert!(shutdown_status.await.is_ok());
+}
+
+/* FIXME: Commented out until https://github.com/tokio-rs/tokio/pull/2337 is merged.
+#[tokio::test]
+async fn linkdead_via_ioerror() {
+    //init_logging();
+
+    let (mut stream_producer, producer_rx) = channel::channel(2);
+    let socket = TestStreamProducer::new(producer_rx);
+
+    // so that we can signal shutdown
+    let (control_write, control_read) = channel::unbounded_channel();
+    let (_data_write, data_read) = channel::unbounded_channel();
+
+    // sharing the idgen so that we can get the client stream_ids
+    let id_gen: SharedIdGen<IncrementIdGen> = SharedIdGen::default();
+    let (in_data_tx, mut in_data_rx) = channel::channel(10);
+    let multiplexer = Multiplexer::with_id_gen(8, id_gen.clone(), data_read, vec![in_data_tx]);
+
+    // start the loop
+    let shutdown_status = tokio::task::spawn(multiplexer.run(socket, control_read));
+
+    // connect a client that has an io error
+    let io_error = std::io::Error::new(io::ErrorKind::ConnectionReset, "Oh no Mr. Bill!");
+    let client1 = tokio_test::io::Builder::new().read_error(io_error).build();
+    stream_producer.send(Ok(client1)).await.unwrap();
+    let client1_id = id_gen.wait_for_next_id().await;
+    assert_eq!(1, client1_id);
+
+    let message = in_data_rx.recv().await.expect("Should have connected.");
+    matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
+
+    let packet = in_data_rx.recv().await.expect("Should have received error");
+    match packet.value().expect("should have error message") {
+        Err(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+            assert_eq!("Oh no Mr. Bill!", format!("{}", error));
+        }
+        _ => panic!("Should have been an error."),
+    }
+
+    // Validate that a linkdead packet is sent.
+    // There were no packets in the mock it should be linkdead now.
+    let message = in_data_rx.recv().await.expect("should have gone linkdead");
+    assert_eq!(client1_id, message.id());
+    matches::assert_matches!(
+        message,
+        IncomingPacket::StreamDisconnected(_, DisconnectReason::Linkdead)
+    );
+
+    // Stop multiplexer
+    control_write.send(ControlMessage::Shutdown).unwrap();
+
+    assert!(shutdown_status.await.is_ok());
+}
+*/
+
+#[tokio::test]
+async fn write_half_full() {
+    //init_logging();
+
+    let (mut stream_producer, producer_rx) = channel::channel(2);
+    let socket = TestStreamProducer::new(producer_rx);
+
+    // so that we can signal shutdown
+    let (control_write, control_read) = channel::unbounded_channel();
+    let (data_write, data_read) = channel::unbounded_channel();
+
+    // sharing the idgen so that we can get the client stream_ids
+    let id_gen: SharedIdGen<IncrementIdGen> = SharedIdGen::default();
+    let (in_data_tx, mut in_data_rx) = channel::channel(10);
+
+    // Buffer size set to 2
+    let buffer_size = 2;
+    let multiplexer =
+        Multiplexer::with_id_gen(buffer_size, id_gen.clone(), data_read, vec![in_data_tx]);
+
+    // start the loop
+    let shutdown_status = tokio::task::spawn(multiplexer.run(socket, control_read));
+
+    // Connect a fake client that waits for 2 seconds for io
+    let client1 = tokio_test::io::Builder::new()
+        .wait(Duration::from_secs(1))
+        .build();
+    stream_producer.send(Ok(client1)).await.unwrap();
+    let client1_id = id_gen.wait_for_next_id().await;
+    assert_eq!(1, client1_id);
+
+    let message = in_data_rx.recv().await.expect("Should have connected.");
+    matches::assert_matches!(message, IncomingPacket::StreamConnected(_));
+
+    // Hit it with enough messages to stuff it.
+    for _ in 0..=32 {
+        let data = Bytes::from("a message");
+        data_write
+            .send(OutgoingMessage::new(vec![client1_id], vec![data.clone()]).into())
+            .unwrap();
+    }
+
+    // Validate that a linkdead packet is sent.
+    // There were no packets in the mock it should be linkdead now.
+    let message = in_data_rx.recv().await.expect("should have gone linkdead");
+    assert_eq!(client1_id, message.id());
+    matches::assert_matches!(
+        message,
+        IncomingPacket::StreamDisconnected(_, DisconnectReason::Linkdead)
     );
 
     // Stop multiplexer

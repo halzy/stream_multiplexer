@@ -276,6 +276,7 @@ where
                     next_reader = reader.next(), if !reader.is_empty() => {
                         let mut next_reader = next_reader;
                         let (packet_res, packet_reader) = next_reader.take().expect("reader.next() is never called if it's empty");
+                        let stream_id:Option<usize> = packet_reader.stream().map(|stream| stream.stream_id()).flatten();
 
                         tracing::trace!("incoming data");
                         match packet_res {
@@ -289,7 +290,19 @@ where
                             }
                             None => {
                                 // Dropping packet reader, stream is done
-                                tracing::error!("incoming reader received None");
+                                tracing::trace!("incoming reader received None");
+
+                                if let Some(stream_id) = stream_id {
+
+                                    let packet_leave = IncomingPacket::StreamDisconnected::<ReadSt::Item>(
+                                        stream_id,
+                                        DisconnectReason::Linkdead
+                                    );
+                                    if let Err(_) = incoming_packet_sink.send(packet_leave).await {
+                                        tracing::error!("Could not send out stream disconnect.");
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }

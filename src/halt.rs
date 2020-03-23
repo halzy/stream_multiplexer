@@ -132,7 +132,7 @@ where
                     let _ = self.shutdown();
                     Poll::Ready(Some(IncomingPacket::StreamDisconnected(
                         stream_id,
-                        DisconnectReason::Graceful,
+                        DisconnectReason::Linkdead,
                     )))
                 }
             }

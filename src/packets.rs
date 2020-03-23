@@ -24,7 +24,8 @@ impl<V> IncomingMessage<V> {
 /// The reason why a stream was removed from a channel.
 pub enum DisconnectReason {
     /// Stream client disconnected.
-    Graceful,
+    /// Could be a normal disconnect, or caused by an IO Error.
+    Linkdead,
 
     /// Stream was moved into the given channel.
     ChannelChange(ChannelId),
