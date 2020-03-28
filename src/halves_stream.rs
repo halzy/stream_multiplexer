@@ -1,3 +1,5 @@
+use crate::IncomingStream;
+
 use futures::stream::TryStream;
 use futures::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
@@ -7,7 +9,7 @@ use std::pin::Pin;
 use std::task::Poll;
 
 /// Takes a Stream<Item=AsyncRead + AsyncWrite> and provides a
-/// Stream<Item=( FramedWrite<WriteHalf, LengthDelimitedCodec>, FramedRead<ReadHalf, LengthDelimitedCodec>)>
+/// Stream<Item=IncomingStream<FramedRead<ReadHalf, LengthDelimitedCodec, FramedWrite<WriteHalf, LengthDelimitedCodec>>>
 #[derive(Debug)]
 pub struct HalvesStream<St> {
     inner: St,
@@ -30,10 +32,10 @@ where
     St::Ok: AsyncRead + AsyncWrite,
 {
     type Item = Result<
-        (
-            FramedWrite<WriteHalf<St::Ok>, LengthDelimitedCodec>,
+        IncomingStream<
             FramedRead<ReadHalf<St::Ok>, LengthDelimitedCodec>,
-        ),
+            FramedWrite<WriteHalf<St::Ok>, LengthDelimitedCodec>,
+        >,
         St::Error,
     >;
     fn poll_next(
@@ -55,7 +57,10 @@ where
                     .length_field_length(self.length_field_length)
                     .new_read(reader);
 
-                Poll::Ready(Some(Ok((framed_write, framed_read))))
+                let channel = 0;
+                let incoming_stream = IncomingStream::new(channel, framed_write, framed_read);
+
+                Poll::Ready(Some(Ok(incoming_stream)))
             }
         }
     }

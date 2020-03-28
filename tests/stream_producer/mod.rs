@@ -1,3 +1,5 @@
+use crate::IncomingStream;
+
 use futures::stream::StreamExt;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::codec::length_delimited::LengthDelimitedCodec;
@@ -23,10 +25,10 @@ where
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite,
 {
     type Item = Result<
-        (
-            FramedWrite<WriteHalf<U>, LengthDelimitedCodec>,
+        IncomingStream<
             FramedRead<ReadHalf<U>, LengthDelimitedCodec>,
-        ),
+            FramedWrite<WriteHalf<U>, LengthDelimitedCodec>,
+        >,
         std::io::Error,
     >;
     fn poll_next(
@@ -47,7 +49,9 @@ where
                     .length_field_length(2)
                     .new_read(reader);
 
-                Poll::Ready(Some(Ok((framed_write, framed_read))))
+                let channel = 0;
+                let incoming_stream = IncomingStream::new(channel, framed_write, framed_read);
+                Poll::Ready(Some(Ok(incoming_stream)))
             }
             Some(Err(err)) => Poll::Ready(Some(Err(err))),
         }

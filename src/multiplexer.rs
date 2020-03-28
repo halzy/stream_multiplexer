@@ -198,21 +198,26 @@ where
 
     #[tracing::instrument(
         level = "trace",
-        skip(self, write_half, read_half, incoming_packet_reader_tx)
+        skip(self, incoming_stream, incoming_packet_reader_tx)
     )]
     async fn handle_incoming_connection(
         &mut self,
-        write_half: WriteSi,
-        read_half: ReadSt,
+        incoming_stream: IncomingStream<ReadSt, WriteSi>,
         incoming_packet_reader_tx: &mut IncomingPacketReaderTx<ReadSt>,
     ) {
         tracing::trace!("new connection");
 
+        let IncomingStream {
+            channel,
+            read_stream,
+            write_sink,
+        } = incoming_stream;
+
         // used to re-join the two halves so that we can shut down the reader
-        let (halt, mut async_read_halt) = HaltRead::wrap(read_half);
+        let (halt, mut async_read_halt) = HaltRead::wrap(read_stream);
 
         // Keep track of the write_half and generate a stream_id
-        let sender: Sender<WriteSi> = Sender::new(write_half, halt);
+        let sender: Sender<WriteSi> = Sender::new(write_sink, halt);
 
         let (stream_id_tx, stream_id_rx) = oneshot::channel();
         self.senders_channel
@@ -222,7 +227,12 @@ where
 
         async_read_halt.set_stream_id(stream_id);
 
-        self.enqueue_packet_reader(stream_id, 0, async_read_halt, incoming_packet_reader_tx);
+        self.enqueue_packet_reader(
+            stream_id,
+            channel,
+            async_read_halt,
+            incoming_packet_reader_tx,
+        );
     }
 }
 
@@ -336,7 +346,7 @@ where
         mut control: U,
     ) -> JoinHandle<IoResult<()>>
     where
-        V: Stream<Item = IoResult<(WriteSi, ReadSt)>>,
+        V: Stream<Item = IoResult<IncomingStream<ReadSt, WriteSi>>>,
         V: Unpin + Send + 'static,
         U: Stream<Item = ControlMessage> + Send + Unpin + 'static,
     {
@@ -390,8 +400,8 @@ where
                 tokio::select!(
                     incoming_opt = incoming_halves.next() => {
                         match incoming_opt {
-                            Some(Ok((write_half, read_half))) => {
-                                self.handle_incoming_connection(write_half, read_half, &mut incoming_packet_reader_tx).await;
+                            Some(Ok(incoming_stream)) => {
+                                self.handle_incoming_connection(incoming_stream, &mut incoming_packet_reader_tx).await;
                             }
                             Some(Err(error)) => {
                                 tracing::error!("ERROR: {}", error);
