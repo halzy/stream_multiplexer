@@ -203,3 +203,34 @@ impl<V> From<OutgoingMessage<V>> for OutgoingPacket<V> {
         Self::Message(message)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outgoing_iters_small() {
+        let message = OutgoingMessage::new(vec![1, 2, 3], vec![4, 5, 6]);
+        let packet: OutgoingPacket<u8> = message.into();
+
+        let ids: Vec<usize> = packet.stream_ids().cloned().collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        let values: Vec<u8> = packet.values().unwrap().copied().collect();
+        assert_eq!(values, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn outgoing_iters_large() {
+        let expected_ids: Vec<usize> = (0..20_usize).into_iter().collect();
+        let expected_values: Vec<u8> = (20..40_u8).into_iter().collect();
+        let message = OutgoingMessage::new(expected_ids.clone(), expected_values.clone());
+        let packet: OutgoingPacket<u8> = message.into();
+
+        let actual_ids: Vec<usize> = packet.stream_ids().cloned().collect();
+        assert_eq!(actual_ids, expected_ids);
+
+        let actual_values: Vec<u8> = packet.values().unwrap().copied().collect();
+        assert_eq!(actual_values, expected_values);
+    }
+}
