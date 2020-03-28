@@ -154,6 +154,8 @@ mod send_all_own;
 mod sender;
 mod stream_mover;
 
+use futures::prelude::*;
+
 pub use error::*;
 use halt::*;
 pub use halves_stream::*;
@@ -168,6 +170,38 @@ use stream_mover::*;
 type StreamId = usize;
 type ChannelId = usize;
 
+/// Container for an incoming stream's Read and Write halves.
+#[derive(Debug)]
+pub struct IncomingStream<ReadSt, WriteSi>
+where
+    ReadSt: Stream + Unpin,
+    ReadSt::Item: std::fmt::Debug,
+{
+    /// Channel that the stream should be placed in.
+    channel: ChannelId,
+
+    /// Write half of a connection.
+    write_sink: WriteSi,
+
+    /// Read half of a connection.
+    read_stream: ReadSt,
+}
+
+impl<ReadSt, WriteSi> IncomingStream<ReadSt, WriteSi>
+where
+    ReadSt: Stream + Unpin,
+    ReadSt::Item: std::fmt::Debug,
+{
+    /// Creates a new IncomingStream
+    pub fn new(channel: ChannelId, write_sink: WriteSi, read_stream: ReadSt) -> Self {
+        Self {
+            channel,
+            write_sink,
+            read_stream,
+        }
+    }
+}
+
 /// To control the multiplexer, `ControlMessage` can be sent to the `control` channel passed into
 /// `Multiplexer.run()`
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -178,9 +212,7 @@ pub enum ControlMessage {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-    use futures::prelude::*;
 
     #[allow(dead_code)]
     pub(crate) fn init_logging() {
