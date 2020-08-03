@@ -4,10 +4,10 @@
 [![Latest Version][crates_badge]][crates]
 [![Rust Documentation][docs_badge]][docs]
 
-Highly unstable API!
+This crate provides natural backpressure to classes of streams
 
-This library multiplexes many streams into fewer streams.
-New streams are assigned an identifier. Data from those streams are wrapped in a data structure that contains the Id and Bytes, and then funneled into another stream. 
+Streams are gathered into 'channels' that can be polled via `recv()`. Channels are indpendent
+of each other and have their own backpressure.
 
 [docs_badge]: https://docs.rs/stream_multiplexer/badge.svg
 [docs]: https://docs.rs/stream_multiplexer
