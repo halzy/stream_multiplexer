@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 categories = ["asynchronous", "network-programming"]
 description = "Combines many streams into a few."
 documentation = "https://docs.rs/stream_multiplexer"
-keywords      = ["async", "asynchronous", "multiplex", "stream", "tokio"]
+keywords      = ["async", "asynchronous", "multiplex", "stream", "futures"]
 readme = "README.md"
 repository    = "https://github.com/halzy/stream_multiplexer"
 
