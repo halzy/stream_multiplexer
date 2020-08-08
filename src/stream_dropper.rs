@@ -1,5 +1,6 @@
 use crate::*;
 
+use futures_util::future::Either;
 use futures_util::stream::Stream;
 use futures_util::task::{AtomicWaker, Context, Poll};
 use pin_project_lite::pin_project;
@@ -11,19 +12,22 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 struct Inner {
+    // false = drop, true = change channel
     change_channel: AtomicBool,
+
+    // if channel_change is true, change to this channel
     next_channel: AtomicUsize,
+
     waker: AtomicWaker,
     set: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct StreamDropControl {
+pub(crate) struct StreamHolderControl {
     inner: Arc<Inner>,
 }
 
-// FIXME: Rename, does more than just drop now, also changes channels.
-impl StreamDropControl {
+impl StreamHolderControl {
     pub(crate) fn change_channel(&self, channel_id: ChannelId) {
         self.inner.set.store(true, Relaxed);
         self.inner.change_channel.store(true, Relaxed);
@@ -36,11 +40,7 @@ impl StreamDropControl {
         self.inner.waker.wake();
     }
 
-    pub(crate) fn wrap<T>(
-        id: StreamId,
-        stream: T,
-        channel_change_tx: async_channel::Sender<ChannelChange<T>>,
-    ) -> (Self, StreamDropper<T>) {
+    pub(crate) fn wrap<T>(id: StreamId, stream: T) -> (Self, StreamHolder<T>) {
         let inner = Arc::new(Inner {
             change_channel: AtomicBool::new(false),
             next_channel: AtomicUsize::new(0),
@@ -51,8 +51,7 @@ impl StreamDropControl {
             Self {
                 inner: Arc::clone(&inner),
             },
-            StreamDropper {
-                channel_change_tx,
+            StreamHolder {
                 id,
                 inner,
                 stream: Some(stream),
@@ -63,20 +62,19 @@ impl StreamDropControl {
 
 pin_project! {
     #[derive(Debug)]
-    pub(crate) struct StreamDropper<T> {
+    pub(crate) struct StreamHolder<T> {
         pub id: StreamId,
         #[pin]
         pub stream: Option<T>,
         inner: Arc<Inner>,
-        channel_change_tx: async_channel::Sender<ChannelChange<T>>,
     }
 }
 
-impl<T> StreamDropper<T>
+impl<T> StreamHolder<T>
 where
     T: Stream + Unpin,
 {
-    fn drop_stream(self: Pin<&mut Self>) -> Poll<Option<T::Item>> {
+    fn drop_stream(self: Pin<&mut Self>) -> Poll<Option<Either<T::Item, ChannelChange<T>>>> {
         let this = self.project();
 
         let stream: Option<T> = Option::take(this.stream.get_mut());
@@ -92,9 +90,7 @@ where
                         stream_id: *this.id,
                         stream,
                     };
-                    if let Err(error) = this.channel_change_tx.try_send(channel_change) {
-                        log::error!("Failed to send to change channel stream: {:?}", error);
-                    }
+                    return Poll::Ready(Some(Either::Right(channel_change)));
                 }
                 Poll::Ready(None)
             }
@@ -102,11 +98,11 @@ where
     }
 }
 
-impl<T> Stream for StreamDropper<T>
+impl<T> Stream for StreamHolder<T>
 where
     T: Stream + Unpin,
 {
-    type Item = T::Item;
+    type Item = Either<T::Item, ChannelChange<T>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // quick check to avoid registration if already done.
@@ -129,11 +125,13 @@ where
                 .as_pin_mut()
                 .expect("Stream should exist, haven't shut down yet.")
                 .poll_next(cx)
+                .map(|v| v.map(Either::Left))
         }
     }
 }
 
 /*
+FIXME: put some tests back
 #[cfg(test)]
 mod tests {
     use super::*;

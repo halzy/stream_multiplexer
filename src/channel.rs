@@ -1,10 +1,28 @@
 use crate::*;
 
 use async_channel as channel;
-use futures_util::future::FutureExt;
-use futures_util::stream::{StreamExt, StreamFuture, TryStream};
+use futures_util::future::{Either, FutureExt};
+use futures_util::stream::{StreamExt, StreamFuture};
 
-type ReadStream<T> = StreamDropper<T>;
+type ReadStream<T> = StreamHolder<T>;
+
+pub(crate) enum ChannelKind<T>
+where
+    T: Stream,
+{
+    Value(T::Item),
+    Connected,
+    Disconnected,
+    ChannelChange(ChannelChange<T>),
+}
+
+pub(crate) struct ChannelItem<T>
+where
+    T: Stream,
+{
+    pub(crate) id: StreamId,
+    pub(crate) item: ChannelKind<T>,
+}
 
 #[derive(Debug)]
 pub(crate) struct Channel<T> {
@@ -15,11 +33,12 @@ pub(crate) struct Channel<T> {
 
 impl<T> Channel<T>
 where
-    T: TryStream + Unpin,
+    T: Stream + Unpin,
 {
     pub(crate) fn new(id: ChannelId) -> (channel::Sender<ReadStream<T>>, Self) {
         let (add_tx, add_rx) = channel::unbounded::<ReadStream<T>>();
         let stream_futures = FuturesUnordered::new();
+
         (
             add_tx,
             Self {
@@ -30,40 +49,37 @@ where
         )
     }
 
-    pub(crate) async fn next(&mut self) -> (StreamId, Option<T::Item>) {
-        log::trace!("next() for {}", self.id);
-        // select on the stream-add channel and the FuturesUnordered
+    pub(crate) async fn next(&mut self) -> ChannelItem<T> {
         loop {
+            // select on the stream-add channel and the FuturesUnordered
             if self.stream_futures.is_empty() {
-                log::trace!("channel {} is empty, awaiting streams.", self.id);
-                let added_stream_res = self.add_rx.recv().await;
+                log::trace!("Channel({})::next() awaiting streams.", self.id);
+                let added_stream_res = self.add_rx.next().await;
                 // return the erorr if there was one
-                self.process_stream_add(added_stream_res);
+                return self.process_stream_add(added_stream_res);
             } else {
-                log::trace!("channel {} is awaiting streams or packets", self.id);
-                futures_util::select_biased! {
-                    added_stream_res = self.add_rx.recv().fuse() => {
-                        log::trace!("channel {} adding new stream", self.id);
-                        self.process_stream_add(added_stream_res);
+                log::trace!("Channel({})::next() awaiting streams or packets", self.id);
+                futures_util::select! {
+                    added_stream_res = self.add_rx.next().fuse() => {
+                        return self.process_stream_add(added_stream_res);
                     }
                     stream_output = self.stream_futures.next().fuse() => {
-                        log::trace!("channel {} processing stream data", self.id);
+                        log::trace!("Channel({}) processing stream data", self.id);
                         return self.process_stream_output(stream_output.unwrap()).await;
                     }
-                };
+                }
             }
         }
     }
 
-    fn process_stream_add(
-        &mut self,
-        added_stream: Result<ReadStream<T>, async_channel::RecvError>,
-    ) {
+    fn process_stream_add(&mut self, added_stream: Option<ReadStream<T>>) -> ChannelItem<T> {
         // Unwrapping result as it should not be possbile to have the other end of the channel
         // closed, we hold both ends.
         let added_stream = added_stream.expect("Add channel was closed for adding.");
-
         let stream_id = added_stream.id;
+
+        log::debug!("Channel({}) adding StreamId({})", self.id, stream_id);
+
         if added_stream.stream.is_some() {
             // Add to the FuturesUnordered
             self.stream_futures.push(added_stream.into_future());
@@ -74,23 +90,36 @@ where
                 self.id
             );
         }
+
+        ChannelItem {
+            id: stream_id,
+            item: ChannelKind::Connected,
+        }
     }
 
     async fn process_stream_output(
         &self,
         (output, stream): (
-            Option<T::Item>, // TryStream
+            Option<Either<T::Item, ChannelChange<T>>>, // TryStream
             ReadStream<T>,
         ),
-    ) -> (StreamId, Option<T::Item>) {
+    ) -> ChannelItem<T> {
         let stream_id = stream.id;
 
-        // re-enqueue the stream if it's viable
-        if output.is_some() && stream.stream.is_some() {
+        if output.is_some() {
+            // Add the stream back into the FuturesUnordered
             self.stream_futures.push(stream.into_future());
         }
 
-        // return the bytes from the stream
-        (stream_id, output)
+        let item = match output {
+            None => ChannelKind::Disconnected,
+            Some(Either::Right(channel_change)) => ChannelKind::ChannelChange(channel_change),
+            Some(Either::Left(value)) => ChannelKind::Value(value),
+        };
+
+        ChannelItem {
+            id: stream_id,
+            item,
+        }
     }
 }
