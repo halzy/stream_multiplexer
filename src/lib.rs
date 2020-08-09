@@ -61,12 +61,12 @@ let mut multiplexer_ch_1 = multiplexer.clone();
 smol::Task::spawn(async move {
     while let Ok(stream_item) = multiplexer_ch_1.recv(CHANNEL_ONE).await {
         use ItemKind::*;
-        match stream_item.item {
+        match stream_item.kind {
             Value(Ok(data)) => {
                 // echo the data back and move it to channel 2
-                multiplexer_ch_1.send(vec![stream_item.id], data).await;
+                multiplexer_ch_1.send(vec![stream_item.stream_id], vec![data]).collect::<Vec<_>>().await;
                 multiplexer_ch_1
-                    .change_stream_channel(stream_item.id, CHANNEL_TWO)
+                    .change_stream_channel(stream_item.stream_id, CHANNEL_TWO)
                     .unwrap();
             }
             Value(Err(_err)) => {
@@ -91,20 +91,20 @@ smol::Task::spawn(async move {
 ```
 */
 
-#![forbid(unsafe_code)]
-#![warn(
-    missing_docs,
-    missing_debug_implementations,
-    missing_copy_implementations,
-    trivial_casts,
-    trivial_numeric_casts,
-    unreachable_pub,
-    unsafe_code,
-    unstable_features,
-    unused_import_braces,
-    unused_qualifications,
-    rust_2018_idioms
-)]
+// #![forbid(unsafe_code)]
+// #![warn(
+//     missing_docs,
+//     missing_debug_implementations,
+//     missing_copy_implementations,
+//     trivial_casts,
+//     trivial_numeric_casts,
+//     unreachable_pub,
+//     unsafe_code,
+//     unstable_features,
+//     unused_import_braces,
+//     unused_qualifications,
+//     rust_2018_idioms
+// )]
 
 mod channel;
 
@@ -118,7 +118,7 @@ use stream_dropper::*;
 use async_mutex::Mutex;
 use dashmap::DashMap;
 use futures_util::sink::{Sink, SinkExt};
-use futures_util::stream::{FuturesUnordered, Stream, StreamExt};
+use futures_util::stream::{FuturesUnordered, Stream};
 use parking_lot::RwLock;
 use sharded_slab::Slab;
 
@@ -131,10 +131,10 @@ pub type StreamId = usize;
 /// Used when registering channels with `Multiplexer`.
 pub type ChannelId = usize;
 
-struct ChannelChange<St> {
-    pub(crate) next_channel_id: ChannelId,
-    pub(crate) stream_id: StreamId,
-    pub(crate) stream: St,
+pub struct ChannelChange<St> {
+    pub next_channel_id: ChannelId,
+    pub stream_id: StreamId,
+    pub stream: St,
 }
 
 type AddStreamToChannelTx<St> = async_channel::Sender<StreamHolder<St>>;
@@ -149,8 +149,8 @@ pub enum ItemKind<T> {
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct StreamItem<T> {
-    pub id: StreamId,
-    pub item: ItemKind<T>,
+    pub stream_id: StreamId,
+    pub kind: ItemKind<T>,
 }
 
 type Map<T> = Arc<DashMap<ChannelId, T>>;
@@ -187,6 +187,8 @@ impl<St> ChannelInfo<St> {
     }
 }
 
+/// 1 channel, sinks,
+
 ///
 #[derive(Debug)]
 pub struct Multiplexer<St, Si, Item>
@@ -197,6 +199,19 @@ where
     sinks: Arc<RwLock<Slab<Arc<Mutex<Si>>>>>,
     channels: Map<ChannelInfo<St>>,
     _marker: PhantomData<Item>,
+}
+
+impl<St, Si, Item> Default for Multiplexer<St, Si, Item> {
+    fn default() -> Self {
+        let (stream_controls, sinks, channels, _marker) = Default::default();
+
+        Self {
+            stream_controls,
+            sinks,
+            channels,
+            _marker,
+        }
+    }
 }
 
 impl<St, Si, Item> Clone for Multiplexer<St, Si, Item> {
@@ -216,19 +231,14 @@ impl<St, Si, Item> Clone for Multiplexer<St, Si, Item> {
 
 impl<St, Si, Item> Multiplexer<St, Si, Item>
 where
-    St: Stream + Unpin,
-    Si: Sink<Item> + Unpin,
+    St: Stream,
+    Si: Sink<Item>,
     Si::Error: std::fmt::Debug,
     Item: Clone,
 {
     /// Creates a Multiplexer
     pub fn new() -> Self {
-        Self {
-            channels: Default::default(),
-            sinks: Default::default(),
-            stream_controls: Default::default(),
-            _marker: PhantomData,
-        }
+        Self::default()
     }
 
     /// Adds a channel id to the internal table used for validation checks.
@@ -274,18 +284,53 @@ where
             .ok_or_else(|| MultiplexerError::ChannelNotEmpty)
     }
 
-    /// Sends `data` to a set of `stream_ids`, waiting for them to be sent.
-    pub async fn send(
+    /// Sends `data` to one `stream_id`.
+    pub async fn send_to(
         &self,
+        stream_id: StreamId,
+        data: impl IntoIterator<Item = Item> + Send,
+    ) -> Result<StreamId, MultiplexerError<Si::Error>>
+    where
+        Si: Send + Sync + Unpin,
+        Item: Send + Sync,
+    {
+        // Fetch the write-half of the stream from the slab
+        let slab_read_guard = self.sinks.read(); // read guard
+        let sink = slab_read_guard.get(stream_id); // shard guard
+
+        match sink {
+            Some(sink) => {
+                // Sending data via the stream
+                let mut sink = sink.lock().await;
+                for data in data {
+                    if let Err(err) = sink.send(data).await {
+                        return Err(MultiplexerError::SendError(stream_id, err));
+                    }
+                }
+                Ok(stream_id)
+            }
+            None => {
+                // It's possible for the stream to not be in the slab, should be a rare case.
+                Err(MultiplexerError::UnknownStream(stream_id))
+            }
+        }
+    }
+
+    /// Sends `data` to a set of `stream_ids`, waiting for them to be sent.
+    pub fn send<'a>(
+        &'a self,
         stream_ids: impl IntoIterator<Item = StreamId>,
-        data: Item,
-    ) -> Vec<Result<StreamId, MultiplexerError<Si::Error>>> {
+        data: impl IntoIterator<Item = Item> + Clone + 'a,
+    ) -> impl Stream<Item = Result<StreamId, MultiplexerError<Si::Error>>> + 'a
+    where
+        Si: Send + Sync + Unpin,
+        Item: Send + Sync,
+    {
         let futures: FuturesUnordered<_> = stream_ids
             .into_iter()
-            .map(|stream_id| {
-                // Clone the data before moving it into the async block.
-                let data = data.clone();
-
+            // clones the data for each stream_id
+            .zip(std::iter::repeat(data))
+            .map(move |(stream_id, data)| {
                 // Async block is the return value.
                 async move {
                     let sink = {
@@ -298,13 +343,13 @@ where
                     match sink {
                         Some(sink) => {
                             // Sending data via the stream
-                            sink.lock()
-                                .await
-                                .send(data)
-                                .await
-                                // to match the return type
-                                .map(|()| stream_id)
-                                .map_err(|err| MultiplexerError::SendError(stream_id, err))
+                            let mut sink = sink.lock().await;
+                            for data in data {
+                                if let Err(err) = sink.send(data).await {
+                                    return Err(MultiplexerError::SendError(stream_id, err));
+                                }
+                            }
+                            Ok(stream_id)
                         }
                         None => {
                             // It's possible for the stream to not be in the slab, should be a rare case.
@@ -316,7 +361,7 @@ where
             .collect();
 
         // Waiting for all of the sends to complete
-        futures.collect().await
+        futures
     }
 
     /// Adds `stream` to the `channel` and stores `sink`.
@@ -433,11 +478,17 @@ where
 
     /// Receives the next packet available from a channel:
     ///
-    /// Returns a `StreamItem` or an error.
+    /// Returns a `StreamItem` or `MultiplexerError::UnknownChannel` if called with an unknown
+    /// `channel_id`.
     pub async fn recv(
         &mut self,
         channel_id: ChannelId,
-    ) -> Result<StreamItem<St::Item>, MultiplexerError<Si::Error>> {
+    ) -> Result<StreamItem<St::Item>, MultiplexerError<Si::Error>>
+    where
+        Self: Send + Sync,
+        St: Send + Sync + Unpin,
+        St::Item: Send + Sync,
+    {
         log::trace!("Multiplexer::recv({})", channel_id);
         match self.channels.get(&channel_id) {
             Some(channel_guard) => {
@@ -457,7 +508,7 @@ where
         channel_next: channel::ChannelItem<St>,
     ) -> StreamItem<St::Item> {
         // If the stream is leaving this channel, decrement it's counter
-        let item = match channel_next.item {
+        let kind = match channel_next.kind {
             channel::ChannelKind::Value(value) => ItemKind::Value(value),
             channel::ChannelKind::Connected => ItemKind::Connected,
             channel::ChannelKind::Disconnected => {
@@ -485,8 +536,8 @@ where
         };
 
         StreamItem {
-            id: channel_next.id,
-            item,
+            stream_id: channel_next.id,
+            kind,
         }
     }
 

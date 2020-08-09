@@ -130,26 +130,26 @@ fn create_and_simple_messages() {
             .unwrap();
 
         let connected = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(connected.item, ItemKind::Connected));
-        assert_eq!(first_stream_id, connected.id);
+        assert!(matches!(connected.kind, ItemKind::Connected));
+        assert_eq!(first_stream_id, connected.stream_id);
 
         let connected = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(connected.item, ItemKind::Connected));
-        assert_eq!(second_stream_id, connected.id);
+        assert!(matches!(connected.kind, ItemKind::Connected));
+        assert_eq!(second_stream_id, connected.stream_id);
 
         left_sink_1.send(42).await.unwrap();
 
         // from stream_1
         let item_1 = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(&item_1.item, ItemKind::Value(Ok(42))));
+        assert!(matches!(&item_1.kind, ItemKind::Value(Ok(42))));
 
         left_sink_2.send(24).await.unwrap();
 
         // from stream_2
         let item_2 = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(item_2.item, ItemKind::Value(Ok(24))));
+        assert!(matches!(item_2.kind, ItemKind::Value(Ok(24))));
 
-        assert_ne!(item_1.id, item_2.id);
+        assert_ne!(item_1.stream_id, item_2.stream_id);
     });
 }
 
@@ -173,15 +173,15 @@ fn channel_change() {
             .unwrap();
 
         let connected = mp.recv(first_channel_id).await.unwrap();
-        assert!(matches!(connected.item, ItemKind::Connected));
-        assert_eq!(first_stream_id, connected.id);
+        assert!(matches!(connected.kind, ItemKind::Connected));
+        assert_eq!(first_stream_id, connected.stream_id);
 
         left_sink_1.send(42).await.unwrap();
 
         // from first channel
         let item_1 = mp.recv(first_channel_id).await.unwrap();
-        assert!(matches!(item_1.item, ItemKind::Value(Ok(42))));
-        assert_eq!(first_stream_id, item_1.id);
+        assert!(matches!(item_1.kind, ItemKind::Value(Ok(42))));
+        assert_eq!(first_stream_id, item_1.stream_id);
 
         mp.change_stream_channel(first_stream_id, second_channel_id)
             .unwrap();
@@ -189,21 +189,21 @@ fn channel_change() {
         // When the stream leaves the channel, None is returned
         let item = mp.recv(first_channel_id).await.unwrap();
 
-        assert!(matches!(item.item, ItemKind::ChannelChange));
+        assert!(matches!(item.kind, ItemKind::ChannelChange));
 
-        assert_eq!(first_stream_id, item.id);
+        assert_eq!(first_stream_id, item.stream_id);
 
         // Send another message and check the next channel
         left_sink_1.send(24).await.unwrap();
 
         // from second channel
         let connected = mp.recv(second_channel_id).await.unwrap();
-        assert!(matches!(connected.item, ItemKind::Connected));
-        assert_eq!(first_stream_id, connected.id);
+        assert!(matches!(connected.kind, ItemKind::Connected));
+        assert_eq!(first_stream_id, connected.stream_id);
 
         let item_2 = mp.recv(second_channel_id).await.unwrap();
-        assert!(matches!(item_2.item, ItemKind::Value(Ok(24))));
-        assert_eq!(first_stream_id, item_2.id);
+        assert!(matches!(item_2.kind, ItemKind::Value(Ok(24))));
+        assert_eq!(first_stream_id, item_2.stream_id);
     });
 }
 
@@ -225,22 +225,22 @@ fn stream_drop() {
             .unwrap();
 
         let connected = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(connected.item, ItemKind::Connected));
-        assert_eq!(stream_id_1, connected.id);
+        assert!(matches!(connected.kind, ItemKind::Connected));
+        assert_eq!(stream_id_1, connected.stream_id);
 
         // Verify that the stream is in the channel
         left_sink.send(42).await.unwrap();
         let item_1 = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(item_1.item, ItemKind::Value(Ok(42))));
-        assert_eq!(item_1.id, stream_id_1);
+        assert!(matches!(item_1.kind, ItemKind::Value(Ok(42))));
+        assert_eq!(item_1.stream_id, stream_id_1);
 
         // drop the stream
         assert!(matches!(mp.remove_stream(stream_id_1), Ok(())));
 
         // Get a None when it is removed
         let item_2 = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(item_2.item, ItemKind::Disconnected));
-        assert_eq!(item_2.id, stream_id_1);
+        assert!(matches!(item_2.kind, ItemKind::Disconnected));
+        assert_eq!(item_2.stream_id, stream_id_1);
     });
 }
 
@@ -276,7 +276,7 @@ fn errors() {
         assert!(mp.has_channel(43));
 
         // Sending to non-existent streams
-        let results = mp.send(vec![8], 88_u8).await;
+        let results: Vec<_> = mp.send(Some(8), Some(88_u8)).collect().await;
         assert!(matches!(
             results[0],
             Err(MultiplexerError::UnknownStream(8))
@@ -304,8 +304,8 @@ fn errors() {
 
 #[test]
 fn clones() {
-    smol::block_on(async move {
-        // let _ = alto_logger::init_term_logger();
+    smol::run(async move {
+        let _ = alto_logger::init_term_logger();
 
         let (mut left_sink_1, mut left_stream_1, right_sink_1, right_stream_1) =
             create_byte_stream_pair();
@@ -327,12 +327,12 @@ fn clones() {
             .unwrap();
 
         let connected = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(connected.item, ItemKind::Connected));
-        assert_eq!(stream_id_1, connected.id);
+        assert!(matches!(connected.kind, ItemKind::Connected));
+        assert_eq!(stream_id_1, connected.stream_id);
 
         let connected = mp.recv(channel_id).await.unwrap();
-        assert!(matches!(connected.item, ItemKind::Connected));
-        assert_eq!(stream_id_2, connected.id);
+        assert!(matches!(connected.kind, ItemKind::Connected));
+        assert_eq!(stream_id_2, connected.stream_id);
 
         smol::Task::spawn(async move {
             loop {
@@ -343,6 +343,7 @@ fn clones() {
             }
         })
         .detach();
+
         smol::Task::spawn(async move {
             loop {
                 left_sink_2
@@ -355,28 +356,30 @@ fn clones() {
 
         let mp1: Multiplexer<_, _, _> = mp.clone();
         smol::Task::spawn(async move {
-            let streams = vec![stream_id_1];
-            mp1.send(streams, 33_u8).await;
+            mp1.send(Some(stream_id_1), Some(33_u8))
+                .for_each(|_| async move { () })
+                .await;
         })
         .detach();
 
         let mp2 = mp.clone();
         smol::Task::spawn(async move {
-            let streams = vec![stream_id_2];
-            mp2.send(streams, 22_u8).await;
+            mp2.send(Some(stream_id_2), Some(22_u8))
+                .for_each(|_| async move { () })
+                .await;
         })
         .detach();
 
         let res1 = mp.recv(channel_id).await.unwrap();
         let res2 = mp.recv(channel_id).await.unwrap();
 
-        if res1.id == stream_id_1 {
-            assert!(matches!(res1.item, ItemKind::Value(Ok(33))));
-            assert!(matches!(res2.item, ItemKind::Value(Ok(22))));
+        if res1.stream_id == stream_id_1 {
+            assert!(matches!(res1.kind, ItemKind::Value(Ok(33))));
+            assert!(matches!(res2.kind, ItemKind::Value(Ok(22))));
         } else {
-            assert_eq!(res2.id, stream_id_2);
-            assert!(matches!(res1.item, ItemKind::Value(Ok(22))));
-            assert!(matches!(res2.item, ItemKind::Value(Ok(33))));
+            assert_eq!(res2.stream_id, stream_id_2);
+            assert!(matches!(res1.kind, ItemKind::Value(Ok(22))));
+            assert!(matches!(res2.kind, ItemKind::Value(Ok(33))));
         }
     });
 }

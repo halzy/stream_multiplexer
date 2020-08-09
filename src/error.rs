@@ -30,6 +30,7 @@ pub enum MultiplexerError<SE: std::fmt::Debug> {
     #[error("Could not send item to sink {0} due to {1:?}")]
     SendError(StreamId, SE),
 
+    /// FIXME
     #[error("Channel has streams.")]
     ChannelNotEmpty,
 }

@@ -21,7 +21,7 @@ where
     T: Stream,
 {
     pub(crate) id: StreamId,
-    pub(crate) item: ChannelKind<T>,
+    pub(crate) kind: ChannelKind<T>,
 }
 
 #[derive(Debug)]
@@ -33,7 +33,7 @@ pub(crate) struct Channel<T> {
 
 impl<T> Channel<T>
 where
-    T: Stream + Unpin,
+    T: Stream,
 {
     pub(crate) fn new(id: ChannelId) -> (channel::Sender<ReadStream<T>>, Self) {
         let (add_tx, add_rx) = channel::unbounded::<ReadStream<T>>();
@@ -49,7 +49,11 @@ where
         )
     }
 
-    pub(crate) async fn next(&mut self) -> ChannelItem<T> {
+    pub(crate) async fn next(&mut self) -> ChannelItem<T>
+    where
+        T: Send + Sync + Unpin,
+        T::Item: Send + Sync,
+    {
         loop {
             // select on the stream-add channel and the FuturesUnordered
             if self.stream_futures.is_empty() {
@@ -72,7 +76,10 @@ where
         }
     }
 
-    fn process_stream_add(&mut self, added_stream: Option<ReadStream<T>>) -> ChannelItem<T> {
+    fn process_stream_add(&mut self, added_stream: Option<ReadStream<T>>) -> ChannelItem<T>
+    where
+        T: Send + Sync + Unpin,
+    {
         // Unwrapping result as it should not be possbile to have the other end of the channel
         // closed, we hold both ends.
         let added_stream = added_stream.expect("Add channel was closed for adding.");
@@ -93,7 +100,7 @@ where
 
         ChannelItem {
             id: stream_id,
-            item: ChannelKind::Connected,
+            kind: ChannelKind::Connected,
         }
     }
 
@@ -103,7 +110,10 @@ where
             Option<Either<T::Item, ChannelChange<T>>>, // TryStream
             ReadStream<T>,
         ),
-    ) -> ChannelItem<T> {
+    ) -> ChannelItem<T>
+    where
+        T: Send + Sync + Unpin,
+    {
         let stream_id = stream.id;
 
         if output.is_some() {
@@ -111,7 +121,7 @@ where
             self.stream_futures.push(stream.into_future());
         }
 
-        let item = match output {
+        let kind = match output {
             None => ChannelKind::Disconnected,
             Some(Either::Right(channel_change)) => ChannelKind::ChannelChange(channel_change),
             Some(Either::Left(value)) => ChannelKind::Value(value),
@@ -119,7 +129,7 @@ where
 
         ChannelItem {
             id: stream_id,
-            item,
+            kind,
         }
     }
 }
