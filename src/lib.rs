@@ -106,479 +106,241 @@ smol::Task::spawn(async move {
 //     rust_2018_idioms
 // )]
 
-mod channel;
-
 mod error;
-mod stream_dropper;
-
-use channel::Channel;
+mod notify;
 pub use error::MultiplexerError;
-use stream_dropper::*;
+use notify::*;
 
-use async_mutex::Mutex;
-use dashmap::DashMap;
-use futures_util::sink::{Sink, SinkExt};
-use futures_util::stream::{FuturesUnordered, Stream};
-use parking_lot::RwLock;
-use sharded_slab::Slab;
-
-use std::marker::PhantomData;
-use std::sync::Arc;
-
-/// A value returned by `Multiplexer` when a stream pair is added.
-pub type StreamId = usize;
-
-/// Used when registering channels with `Multiplexer`.
-pub type ChannelId = usize;
-
-pub struct ChannelChange<St> {
-    pub next_channel_id: ChannelId,
-    pub stream_id: StreamId,
-    pub stream: St,
-}
-
-type AddStreamToChannelTx<St> = async_channel::Sender<StreamHolder<St>>;
+use async_channel::*;
+use futures_lite::*;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
 pub enum ItemKind<T> {
     Value(T),
     Connected,
     Disconnected,
-    ChannelChange,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
-pub struct StreamItem<T> {
-    pub stream_id: StreamId,
+pub struct StreamItem<T, Id> {
+    pub stream_id: Id,
     pub kind: ItemKind<T>,
 }
 
-type Map<T> = Arc<DashMap<ChannelId, T>>;
-type StreamCount = usize;
-
-#[derive(Debug)]
-struct ChannelInfo<St> {
-    add_stream_channel: AddStreamToChannelTx<St>,
-    channel: Arc<Mutex<Channel<St>>>,
-    stream_count: StreamCount,
-}
-
-impl<St> Clone for ChannelInfo<St> {
-    fn clone(&self) -> Self {
-        Self {
-            add_stream_channel: self.add_stream_channel.clone(),
-            channel: Arc::clone(&self.channel),
-            stream_count: self.stream_count,
-        }
-    }
-}
-
-impl<St> ChannelInfo<St> {
-    fn new(
-        add_stream_channel: AddStreamToChannelTx<St>,
-        channel: Arc<Mutex<Channel<St>>>,
-        stream_count: StreamCount,
-    ) -> Self {
-        Self {
-            add_stream_channel,
-            channel,
-            stream_count,
-        }
-    }
-}
-
-/// 1 channel, sinks,
-
-///
-#[derive(Debug)]
-pub struct Multiplexer<St, Si, Item>
+struct Ejection<St, Id>
 where
     St: 'static,
 {
-    stream_controls: Arc<DashMap<StreamId, StreamHolderControl>>,
-    sinks: Arc<RwLock<Slab<Arc<Mutex<Si>>>>>,
-    channels: Map<ChannelInfo<St>>,
-    _marker: PhantomData<Item>,
+    landed_streams: HashMap<Id, St>,
+    eject_channel_tx: Sender<(Id, St)>,
+    eject_channel_rx: Receiver<(Id, St)>,
 }
 
-impl<St, Si, Item> Default for Multiplexer<St, Si, Item> {
-    fn default() -> Self {
-        let (stream_controls, sinks, channels, _marker) = Default::default();
-
+impl<St, Id> Ejection<St, Id>
+where
+    Id: Eq + std::hash::Hash + Clone,
+{
+    pub fn new() -> Self {
+        let (eject_channel_tx, eject_channel_rx) = async_channel::unbounded();
         Self {
-            stream_controls,
-            sinks,
-            channels,
-            _marker,
+            eject_channel_rx,
+            eject_channel_tx,
+            landed_streams: Default::default(),
+        }
+    }
+
+    pub fn channel(&self) -> Sender<(Id, St)> {
+        self.eject_channel_tx.clone()
+    }
+
+    pub async fn recv(&mut self, stream_id: Id) -> St
+    where
+        Id: Send + Sync + Clone,
+        St: Send + Sync + Unpin + 'static,
+    {
+        if let Entry::Occupied(entry) = self.landed_streams.entry(stream_id.clone()) {
+            let (_id, stream) = entry.remove_entry();
+            return stream;
+        }
+
+        loop {
+            let (id, stream) = self
+                .eject_channel_rx
+                .recv()
+                .await
+                .expect("Should not fail, other end is owned too");
+
+            if id == stream_id {
+                return stream;
+            }
+
+            self.landed_streams
+                .insert(id, stream)
+                .expect("Should not exist, it was checked above");
         }
     }
 }
 
-impl<St, Si, Item> Clone for Multiplexer<St, Si, Item> {
-    fn clone(&self) -> Self {
-        let stream_controls = Arc::clone(&self.stream_controls);
-        let sinks = Arc::clone(&self.sinks);
-        let channels = Arc::clone(&self.channels);
-
-        Self {
-            stream_controls,
-            sinks,
-            channels,
-            _marker: PhantomData,
-        }
-    }
+///
+pub struct Multiplexer<St, Id>
+where
+    St: Stream + 'static,
+    Id: std::hash::Hash + Eq + 'static,
+{
+    stream_controls: HashMap<Id, Notifier>,
+    stream_of_items_tx: Sender<StreamItem<St::Item, Id>>,
+    stream_of_items_rx: Receiver<StreamItem<St::Item, Id>>,
+    ejection: Ejection<St, Id>,
 }
 
-impl<St, Si, Item> Multiplexer<St, Si, Item>
+impl<St, Id> Multiplexer<St, Id>
 where
     St: Stream,
-    Si: Sink<Item>,
-    Si::Error: std::fmt::Debug,
-    Item: Clone,
+    Id: std::hash::Hash + Eq + Clone + 'static,
 {
     /// Creates a Multiplexer
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Adds a channel id to the internal table used for validation checks.
-    ///
-    /// Returns an error if `channel` already exists.
-    pub fn add_channel(
-        &mut self,
-        channel_id: ChannelId,
-    ) -> Result<(), MultiplexerError<Si::Error>> {
-        // Ensure that the channel does not already exist
-        if self.has_channel(channel_id) {
-            return Err(MultiplexerError::DuplicateChannel(channel_id));
-        }
-
-        // Create the channel and store it
-        let (add_tx, channel) = Channel::new(channel_id);
-        let channel = Mutex::new(channel);
-        // set the stream count to zero
-        self.channels
-            .insert(channel_id, ChannelInfo::new(add_tx, Arc::new(channel), 0));
-
-        Ok(())
-    }
-
-    /// Returns true if the channel id exists.
-    #[inline]
-    pub fn has_channel(&self, channel: ChannelId) -> bool {
-        self.channels.contains_key(&channel)
-    }
-
-    /// Removes a channel.
-    ///
-    /// It is an error to remove a channel that has streams.
-    pub fn remove_channel(
-        &mut self,
-        channel_id: ChannelId,
-    ) -> Result<(), MultiplexerError<Si::Error>> {
-        self.channels
-            .remove_if_take(&channel_id, |_channel_id, channel_info| {
-                0 == channel_info.stream_count
-            })
-            .map(|_| ())
-            .ok_or_else(|| MultiplexerError::ChannelNotEmpty)
-    }
-
-    /// Sends `data` to one `stream_id`.
-    pub async fn send_to(
-        &self,
-        stream_id: StreamId,
-        data: impl IntoIterator<Item = Item> + Send,
-    ) -> Result<StreamId, MultiplexerError<Si::Error>>
-    where
-        Si: Send + Sync + Unpin,
-        Item: Send + Sync,
-    {
-        // Fetch the write-half of the stream from the slab
-        let slab_read_guard = self.sinks.read(); // read guard
-        let sink = slab_read_guard.get(stream_id); // shard guard
-
-        match sink {
-            Some(sink) => {
-                // Sending data via the stream
-                let mut sink = sink.lock().await;
-                for data in data {
-                    if let Err(err) = sink.send(data).await {
-                        return Err(MultiplexerError::SendError(stream_id, err));
-                    }
-                }
-                Ok(stream_id)
-            }
-            None => {
-                // It's possible for the stream to not be in the slab, should be a rare case.
-                Err(MultiplexerError::UnknownStream(stream_id))
-            }
-        }
-    }
-
-    /// Sends `data` to a set of `stream_ids`, waiting for them to be sent.
-    pub fn send<'a>(
-        &'a self,
-        stream_ids: impl IntoIterator<Item = StreamId>,
-        data: impl IntoIterator<Item = Item> + Clone + 'a,
-    ) -> impl Stream<Item = Result<StreamId, MultiplexerError<Si::Error>>> + 'a
-    where
-        Si: Send + Sync + Unpin,
-        Item: Send + Sync,
-    {
-        let futures: FuturesUnordered<_> = stream_ids
-            .into_iter()
-            // clones the data for each stream_id
-            .zip(std::iter::repeat(data))
-            .map(move |(stream_id, data)| {
-                // Async block is the return value.
-                async move {
-                    let sink = {
-                        // Fetch the write-half of the stream from the slab
-                        let slab_read_guard = self.sinks.read(); // read guard
-                        let sink = slab_read_guard.get(stream_id); // shard guard
-                        sink.map(|s| Arc::clone(&s))
-                    };
-
-                    match sink {
-                        Some(sink) => {
-                            // Sending data via the stream
-                            let mut sink = sink.lock().await;
-                            for data in data {
-                                if let Err(err) = sink.send(data).await {
-                                    return Err(MultiplexerError::SendError(stream_id, err));
-                                }
-                            }
-                            Ok(stream_id)
-                        }
-                        None => {
-                            // It's possible for the stream to not be in the slab, should be a rare case.
-                            Err(MultiplexerError::UnknownStream(stream_id))
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        // Waiting for all of the sends to complete
-        futures
-    }
-
-    /// Adds `stream` to the `channel` and stores `sink`.
-    ///
-    /// Returns a `StreamId` that represents the pair. It can be used in functions such as `send()` or `change_stream_channel()`.
-    pub fn add_stream_pair(
-        &mut self,
-        sink: Si,
-        stream: St,
-        channel_id: ChannelId,
-    ) -> Result<StreamId, MultiplexerError<Si::Error>> {
-        // Check that we have the channel before we commit the stream to the slab.
-        if !self.channels.contains_key(&channel_id) {
-            return Err(MultiplexerError::UnknownChannel(channel_id));
-        }
-
-        // Add the write-half of the stream to the slab, can't return the stream if there isn't room.
-        let stream_id = self
-            .sinks
-            .write()
-            .insert(Arc::new(Mutex::new(sink)))
-            .ok_or_else(move || MultiplexerError::ChannelFull(channel_id))?;
-
-        // wrap the stream in a dropper so that it can be ejected
-        let (stream_control, stream_dropper) = StreamHolderControl::wrap(stream_id, stream);
-        self.stream_controls.insert(stream_id, stream_control);
-        let mut stream_dropper_mover = Some(stream_dropper);
-
-        if !self
-            .channels
-            .update(&channel_id, move |_k, channel_info: &ChannelInfo<St>| {
-                log::debug!(
-                    "Multiplexer::add_stream_pair() sending StreamId({}) to ChannelId({})",
-                    stream_id,
-                    channel_id
-                );
-
-                // Add the read-half of the stream to the channel
-                if let Err(_err) = channel_info
-                    .add_stream_channel
-                    .try_send(stream_dropper_mover.take().unwrap())
-                {
-                    log::error!("AddTx for Channel({}) does not exist!", channel_id);
-                }
-
-                // Increment stream channel count:
-                let mut channel_info = channel_info.clone();
-                channel_info.stream_count += 1;
-                channel_info
-            })
-        {
-            // undo the previous insert
-            self.sinks.write().remove(stream_id);
-            return Err(MultiplexerError::UnknownChannel(channel_id));
-        }
-
-        Ok(stream_id)
-    }
-
-    /// Signals to the stream that it should move to a given channel.
-    ///
-    /// The channel change is not instantaneous. Calling `.recv()` on the stream's current channel
-    /// may result in that channel receiving more of the stream's data.
-    pub fn change_stream_channel(
-        &self,
-        stream_id: StreamId,
-        channel_id: ChannelId,
-    ) -> Result<(), MultiplexerError<Si::Error>> {
-        // Ensure that the channel exists
-        if !self.has_channel(channel_id) {
-            return Err(MultiplexerError::UnknownChannel(channel_id));
-        }
-
-        // Increment the next channel's stream count this will double-count the stream until it has
-        // left it's existing channel.
-        self.channels.update(&channel_id, |_k, channel_info| {
-            let mut channel_info = channel_info.clone();
-            channel_info.stream_count += 1;
-            channel_info
+    pub fn new(buffer_size: usize) -> Self {
+        // Start the runtime so that we can create tasks later
+        smol::run(async move {
+            let _: () = future::pending().await;
         });
 
-        let control = self
-            .stream_controls
-            .get(&stream_id)
-            .ok_or_else(|| MultiplexerError::UnknownStream(stream_id))?;
+        let (stream_of_items_tx, stream_of_items_rx) = async_channel::bounded(buffer_size);
 
-        control.change_channel(channel_id);
+        Self {
+            stream_controls: Default::default(),
+            stream_of_items_tx,
+            stream_of_items_rx,
+            ejection: Ejection::new(),
+        }
+    }
+
+    /// Adds `stream` with the given `stream_id`.
+    ///
+    /// Returns an error if the `stream_id` already exists.
+    pub fn add_stream(&mut self, stream_id: Id, stream: St) -> Result<(), MultiplexerError>
+    where
+        Id: Send + Sync + Clone,
+        St: Send + Sync + Unpin + 'static,
+        St::Item: Send + Sync + 'static,
+    {
+        let (notifier, notify) = Notify::new();
+
+        match self.stream_controls.entry(stream_id.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(notifier);
+            }
+            Entry::Occupied(_) => {
+                return Err(MultiplexerError::DuplicateStream);
+            }
+        }
+
+        let eject = self.ejection.channel();
+
+        let mut stream_roller =
+            StreamRoller::new(stream_id.clone(), stream, self.stream_of_items_tx.clone());
+
+        smol::Task::spawn(async move {
+            smol::future::race(stream_roller.roll(), notify).await;
+
+            let stream = stream_roller.into_stream();
+
+            return eject.send((stream_id, stream)).await.unwrap();
+        })
+        .detach();
 
         Ok(())
     }
 
-    /// Removes the stream from the multiplexer
-    pub fn remove_stream(
-        &mut self,
-        stream_id: StreamId,
-    ) -> Result<(), MultiplexerError<Si::Error>> {
-        log::trace!("Attempting to remove stream {}", stream_id);
-
-        // Removing it first from the sinks because the sinks are checked when changing channels
-        let res = self.sinks.write().take(stream_id);
-        log::trace!("Stream {} exists", stream_id);
-
+    /// Removes the stream from the multiplexer.
+    ///
+    /// Will only be able to return stream if `recv()` is being polled.
+    pub async fn remove_stream(&mut self, stream_id: Id) -> Result<St, MultiplexerError>
+    where
+        Id: std::fmt::Debug,
+        Id: Send + Sync + Clone,
+        St: Send + Sync + Stream + Unpin,
+        St::Item: Send + Sync,
+    {
         // If the stream is changing channels, it may not have a control and will be dropped in process_add_channel
-        if let Some(control) = self.stream_controls.get(&stream_id) {
-            log::trace!("Stream {} is getting dropped()", stream_id);
-            control.drop_stream();
-        }
+        let control = self
+            .stream_controls
+            .remove(&stream_id)
+            .ok_or_else(|| MultiplexerError::UnknownStream)?;
 
-        // the channel's stream count will be updated when the stream drops
+        control.notify();
 
-        res.map(|_| ())
-            .ok_or_else(|| MultiplexerError::UnknownStream(stream_id))
+        Ok(self.ejection.recv(stream_id).await)
     }
 
     /// Receives the next packet available from a channel:
     ///
     /// Returns a `StreamItem` or `MultiplexerError::UnknownChannel` if called with an unknown
     /// `channel_id`.
-    pub async fn recv(
-        &mut self,
-        channel_id: ChannelId,
-    ) -> Result<StreamItem<St::Item>, MultiplexerError<Si::Error>>
+    pub async fn recv(&mut self) -> StreamItem<St::Item, Id>
     where
-        Self: Send + Sync,
-        St: Send + Sync + Unpin,
+        Id: Send + Sync + Clone,
+        St: Send + Sync + Stream + Unpin,
         St::Item: Send + Sync,
     {
-        log::trace!("Multiplexer::recv({})", channel_id);
-        match self.channels.get(&channel_id) {
-            Some(channel_guard) => {
-                let channel_guard_value = channel_guard.value();
-                let mut channel = channel_guard_value.channel.lock().await;
-
-                let channel_next = channel.next().await;
-                Ok(self.process_channel_next(channel_id, channel_next))
-            }
-            None => Err(MultiplexerError::UnknownChannel(channel_id)),
-        }
+        self.stream_of_items_rx
+            .recv()
+            .await
+            .expect("The other end of the channel we hold should not drop.")
     }
+}
 
-    fn process_channel_next(
-        &mut self,
-        channel_id: ChannelId,
-        channel_next: channel::ChannelItem<St>,
-    ) -> StreamItem<St::Item> {
-        // If the stream is leaving this channel, decrement it's counter
-        let kind = match channel_next.kind {
-            channel::ChannelKind::Value(value) => ItemKind::Value(value),
-            channel::ChannelKind::Connected => ItemKind::Connected,
-            channel::ChannelKind::Disconnected => {
-                // stream is dropping, decrement stream count in channel
-                self.channels.update(&channel_id, |_k, channel_info| {
-                    let mut channel_info = channel_info.clone();
-                    channel_info.stream_count -= 1;
-                    channel_info
-                });
-                ItemKind::Disconnected
-            }
-            channel::ChannelKind::ChannelChange(channel_change) => {
-                // FIXME: change the channel
-                self.process_channel_change(channel_id, channel_change);
+struct StreamRoller<St, Id>
+where
+    St: Stream,
+{
+    stream_id: Id,
+    stream: St,
+    stream_of_items: Sender<StreamItem<St::Item, Id>>,
+}
 
-                // stream is moving into another channel, decrement stream count in channel
-                self.channels.update(&channel_id, |_k, channel_info| {
-                    let mut channel_info = channel_info.clone();
-                    channel_info.stream_count -= 1;
-                    channel_info
-                });
-
-                ItemKind::ChannelChange
-            }
-        };
-
-        StreamItem {
-            stream_id: channel_next.id,
-            kind,
-        }
-    }
-
-    fn process_channel_change(&mut self, channel_id: ChannelId, channel_change: ChannelChange<St>) {
-        let ChannelChange {
-            next_channel_id,
+impl<St, Id> StreamRoller<St, Id>
+where
+    Id: Send + Sync + Clone,
+    St: Send + Sync + Stream + Unpin,
+    St::Item: Send + Sync,
+{
+    fn new(stream_id: Id, stream: St, stream_of_items: Sender<StreamItem<St::Item, Id>>) -> Self {
+        Self {
             stream_id,
             stream,
-        } = channel_change;
+            stream_of_items,
+        }
+    }
 
-        // Channel should exist due to channel_stream_count
-        debug_assert!(self.channels.contains_key(&next_channel_id));
+    fn into_stream(self) -> St {
+        self.stream
+    }
 
-        // If the sink has been dropped, don't add this half to a channel
-        if self.sinks.read().contains(stream_id) {
-            // Wrap the stream in another drop control
-            let (stream_control, stream_dropper) = StreamHolderControl::wrap(stream_id, stream);
-            self.stream_controls.insert(stream_id, stream_control);
+    pub async fn roll(&mut self) {
+        self.stream_of_items
+            .send(StreamItem {
+                stream_id: self.stream_id.clone(),
+                kind: ItemKind::Connected,
+            })
+            .await
+            .unwrap();
+        loop {
+            // FIXME: stop looping with disconnect
+            let kind = match self.stream.next().await {
+                Some(item) => ItemKind::Value(item),
+                None => ItemKind::Disconnected,
+            };
 
-            if let Some(channel) = self.channels.get(&next_channel_id) {
-                log::debug!(
-                    "process_channel_change sending StreamId({}) on ChannelId({}) to ChannelId({})",
-                    stream_id,
-                    channel_id,
-                    next_channel_id
-                );
-                if let Err(_err) = channel.add_stream_channel.try_send(stream_dropper) {
-                    log::error!(
-                        "Channel({}) vanished while moving stream {} into it.",
-                        next_channel_id,
-                        stream_id
-                    );
-                }
-            }
-        } else {
-            log::debug!(
-                "Stream {} dropped while it was changing channels ({} to {})",
-                stream_id,
-                channel_id,
-                next_channel_id
-            );
+            self.stream_of_items
+                .send(StreamItem {
+                    stream_id: self.stream_id.clone(),
+                    kind,
+                })
+                .await
+                .unwrap();
         }
     }
 }

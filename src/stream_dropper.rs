@@ -1,59 +1,55 @@
-use crate::*;
-
+use async_channel as channel;
 use futures_util::future::Either;
-use futures_util::stream::Stream;
+use futures_util::stream::{Stream, StreamExt};
 use futures_util::task::{AtomicWaker, Context, Poll};
 use pin_project_lite::pin_project;
 
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
 #[derive(Debug)]
 struct Inner {
-    // false = drop, true = change channel
-    change_channel: AtomicBool,
-
-    // if channel_change is true, change to this channel
-    next_channel: AtomicUsize,
-
     waker: AtomicWaker,
     set: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct StreamHolderControl {
+pub(crate) struct StreamHolderControl<T> {
     inner: Arc<Inner>,
+    return_channel: channel::Receiver<T>,
 }
 
-impl StreamHolderControl {
-    pub(crate) fn change_channel(&self, channel_id: ChannelId) {
-        self.inner.set.store(true, Relaxed);
-        self.inner.change_channel.store(true, Relaxed);
-        self.inner.next_channel.store(channel_id, Relaxed);
-        self.inner.waker.wake();
-    }
-
-    pub(crate) fn drop_stream(&self) {
+impl<T> StreamHolderControl<T> {
+    pub(crate) async fn return_stream(&self) -> Option<T> {
         self.inner.set.store(true, Relaxed);
         self.inner.waker.wake();
+
+        match self.return_channel.recv().await {
+            Err(err) => {
+                log::error!("return_stream failed to receive stream: {:?}", err);
+                None
+            }
+            Ok(stream) => Some(stream),
+        }
     }
 
-    pub(crate) fn wrap<T>(id: StreamId, stream: T) -> (Self, StreamHolder<T>) {
+    pub(crate) fn wrap<Id>(stream_id: Id, stream: T) -> (Self, StreamHolder<T, Id>) {
+        let (tx, rx) = channel::bounded(1);
         let inner = Arc::new(Inner {
-            change_channel: AtomicBool::new(false),
-            next_channel: AtomicUsize::new(0),
             set: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         });
         (
             Self {
                 inner: Arc::clone(&inner),
+                return_channel: rx,
             },
             StreamHolder {
-                id,
+                stream_id,
                 inner,
+                return_channel: tx,
                 stream: Some(stream),
             },
         )
@@ -62,19 +58,20 @@ impl StreamHolderControl {
 
 pin_project! {
     #[derive(Debug)]
-    pub(crate) struct StreamHolder<T> {
-        pub id: StreamId,
+    pub(crate) struct StreamHolder<T, Id> {
+        pub stream_id: Id,
         #[pin]
         pub stream: Option<T>,
         inner: Arc<Inner>,
+        return_channel: channel::Sender<T>,
     }
 }
 
-impl<T> StreamHolder<T>
+impl<T, Id> StreamHolder<T, Id>
 where
     T: Stream + Unpin,
 {
-    fn drop_stream(self: Pin<&mut Self>) -> Poll<Option<Either<T::Item, ChannelChange<T>>>> {
+    fn return_stream(self: Pin<&mut Self>) -> Poll<Option<T::Item>> {
         let this = self.project();
 
         let stream: Option<T> = Option::take(this.stream.get_mut());
@@ -82,15 +79,11 @@ where
         match stream {
             None => Poll::Ready(None),
             Some(stream) => {
-                if this.inner.change_channel.load(Relaxed) {
-                    // Either drop or put the stream into the async_channel
-                    let next_channel_id = this.inner.next_channel.load(Relaxed);
-                    let channel_change = ChannelChange {
-                        next_channel_id,
-                        stream_id: *this.id,
-                        stream,
-                    };
-                    return Poll::Ready(Some(Either::Right(channel_change)));
+                if let Err(err) = this.return_channel.try_send(stream) {
+                    log::error!(
+                        "Could not return the stream, return_channel failed: {:?}",
+                        err
+                    );
                 }
                 Poll::Ready(None)
             }
@@ -98,16 +91,16 @@ where
     }
 }
 
-impl<T> Stream for StreamHolder<T>
+impl<T, Id> Stream for StreamHolder<T, Id>
 where
     T: Stream + Unpin,
 {
-    type Item = Either<T::Item, ChannelChange<T>>;
+    type Item = T::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // quick check to avoid registration if already done.
         if self.inner.set.load(Relaxed) {
-            return Self::drop_stream(self);
+            return Self::return_stream(self);
         }
 
         self.inner.waker.register(cx.waker());
@@ -115,7 +108,7 @@ where
         // Need to check condition **after** `register` to avoid a race
         // condition that would result in lost notifications.
         if self.inner.set.load(Relaxed) {
-            Self::drop_stream(self)
+            Self::return_stream(self)
         } else {
             let this = self.project();
             // is only ever Some() here because inner.set being true
@@ -125,7 +118,6 @@ where
                 .as_pin_mut()
                 .expect("Stream should exist, haven't shut down yet.")
                 .poll_next(cx)
-                .map(|v| v.map(Either::Left))
         }
     }
 }
