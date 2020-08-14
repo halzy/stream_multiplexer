@@ -7,7 +7,10 @@ use futures_util::sink::SinkExt;
 
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 type Item = StreamItem<Result<u8, std::io::Error>, usize>;
 
@@ -130,7 +133,7 @@ fn create_and_simple_messages() {
 
         let (executor, spawner) = Executor::new();
         executor.run(2);
-        let mut mp1 = Multiplexer::new(32, spawner);
+        let mut mp1 = Multiplexer::new(32, Arc::new(spawner));
         mp1.add_stream(first_stream_id, right_stream_1).unwrap();
         mp1.add_stream(second_stream_id, right_stream_2).unwrap();
 
@@ -172,7 +175,7 @@ fn channel_change() {
         // Start the test:
         let (executor, spawner) = Executor::new();
         executor.run(2);
-        let mut mp1 = Multiplexer::new(32, spawner);
+        let mut mp1 = Multiplexer::new(32, Arc::new(spawner));
         mp1.add_stream(stream_id, right_stream_1).unwrap();
 
         let connected: Item = mp1.recv().await;
@@ -190,7 +193,7 @@ fn channel_change() {
 
         let (executor, spawner) = Executor::new();
         executor.run(2);
-        let mut mp2 = Multiplexer::new(32, spawner);
+        let mut mp2 = Multiplexer::new(32, Arc::new(spawner));
         mp2.add_stream(stream_id, stream).unwrap();
 
         // Send another message and check the next channel
@@ -220,7 +223,7 @@ fn stream_drop() {
         // Start the test
         let (executor, spawner) = Executor::new();
         executor.run(2);
-        let mut mp = Multiplexer::new(32, spawner);
+        let mut mp = Multiplexer::new(32, Arc::new(spawner));
 
         mp.add_stream(stream_id, right_stream).unwrap();
 
@@ -255,8 +258,10 @@ fn errors() {
 
         let (executor, spawner) = Executor::new();
         executor.run(2);
-        let mut mp =
-            Multiplexer::<ByteStream<ReadHalf<Async<UnixStream>>>, usize>::new(32, spawner);
+        let mut mp = Multiplexer::<ByteStream<ReadHalf<Async<UnixStream>>>, usize>::new(
+            32,
+            Arc::new(spawner),
+        );
 
         // should fail to remove non-existent stream
         assert!(matches!(
