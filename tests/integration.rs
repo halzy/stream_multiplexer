@@ -7,10 +7,7 @@ use futures_util::sink::SinkExt;
 
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
-use std::{
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::task::{Context, Poll};
 
 type Item = StreamItem<Result<u8, std::io::Error>, usize>;
 
@@ -131,9 +128,7 @@ fn create_and_simple_messages() {
         let first_stream_id = 1;
         let second_stream_id = 2;
 
-        let (executor, spawner) = Executor::new();
-        executor.run(2);
-        let mut mp1 = Multiplexer::new(32, Arc::new(spawner));
+        let mut mp1 = Multiplexer::new(32);
         mp1.add_stream(first_stream_id, right_stream_1).unwrap();
         mp1.add_stream(second_stream_id, right_stream_2).unwrap();
 
@@ -173,9 +168,7 @@ fn channel_change() {
         let stream_id = 7432;
 
         // Start the test:
-        let (executor, spawner) = Executor::new();
-        executor.run(2);
-        let mut mp1 = Multiplexer::new(32, Arc::new(spawner));
+        let mut mp1 = Multiplexer::new(32);
         mp1.add_stream(stream_id, right_stream_1).unwrap();
 
         let connected: Item = mp1.recv().await;
@@ -191,9 +184,7 @@ fn channel_change() {
 
         let stream = mp1.remove_stream(stream_id).await.unwrap();
 
-        let (executor, spawner) = Executor::new();
-        executor.run(2);
-        let mut mp2 = Multiplexer::new(32, Arc::new(spawner));
+        let mut mp2 = Multiplexer::new(32);
         mp2.add_stream(stream_id, stream).unwrap();
 
         // Send another message and check the next channel
@@ -221,9 +212,7 @@ fn stream_drop() {
         let stream_id = 83;
 
         // Start the test
-        let (executor, spawner) = Executor::new();
-        executor.run(2);
-        let mut mp = Multiplexer::new(32, Arc::new(spawner));
+        let mut mp = Multiplexer::new(32);
 
         mp.add_stream(stream_id, right_stream).unwrap();
 
@@ -256,12 +245,7 @@ fn errors() {
 
         let (_left_sink, _left_stream, _right_sink, _right_stream) = create_byte_stream_pair();
 
-        let (executor, spawner) = Executor::new();
-        executor.run(2);
-        let mut mp = Multiplexer::<ByteStream<ReadHalf<Async<UnixStream>>>, usize>::new(
-            32,
-            Arc::new(spawner),
-        );
+        let mut mp = Multiplexer::<ByteStream<ReadHalf<Async<UnixStream>>>, usize>::new(32);
 
         // should fail to remove non-existent stream
         assert!(matches!(

@@ -136,39 +136,12 @@ pub struct StreamItem<T, Id> {
     pub kind: ItemKind<T>,
 }
 
-pub struct Spawner(async_executor::Spawner);
-pub struct Executor {
-    executor: async_executor::Executor,
-}
-
-impl Executor {
-    pub fn new() -> (Self, Spawner) {
-        let executor = async_executor::Executor::new();
-        let spawner = Spawner(executor.spawner());
-
-        (Self { executor }, spawner)
-    }
-
-    pub fn run(self, threads: usize) {
-        // FIXME: provide shutdown mechanism
-        let executor = std::sync::Arc::new(self.executor);
-
-        for _ in 0..threads {
-            let executor = std::sync::Arc::clone(&executor);
-            std::thread::spawn(move || {
-                executor.run(futures_lite::future::pending::<()>());
-            });
-        }
-    }
-}
-
 /// FIXME: multiplexing readers
 pub struct Multiplexer<St, Id>
 where
     St: Stream + 'static,
     Id: std::hash::Hash + Eq + 'static,
 {
-    spawner: Arc<Spawner>,
     stream_controls: HashMap<Id, Awaker>,
     stream_of_items_tx: Sender<StreamItem<St::Item, Id>>,
     stream_of_items_rx: Receiver<StreamItem<St::Item, Id>>,
@@ -181,11 +154,10 @@ where
     Id: std::hash::Hash + Eq + Clone + 'static,
 {
     /// Creates a Multiplexer
-    pub fn new(buffer_size: usize, spawner: Arc<Spawner>) -> Self {
+    pub fn new(buffer_size: usize) -> Self {
         let (stream_of_items_tx, stream_of_items_rx) = async_channel::bounded(buffer_size);
 
         Self {
-            spawner,
             stream_controls: Default::default(),
             stream_of_items_tx,
             stream_of_items_rx,
@@ -218,17 +190,15 @@ where
         let mut stream_roller =
             StreamRoller::new(stream_id.clone(), stream, self.stream_of_items_tx.clone());
 
-        self.spawner
-            .0
-            .spawn(async move {
-                futures_lite::future::race(stream_roller.roll(), notify).await;
+        async_executor::Task::spawn(async move {
+            futures_lite::future::race(stream_roller.roll(), notify).await;
 
-                let stream = stream_roller.into_stream();
+            let stream = stream_roller.into_stream();
 
-                // If the send fails, multiplexer is shutting down
-                return eject.send((stream_id, stream)).await;
-            })
-            .detach();
+            // If the send fails, multiplexer is shutting down
+            return eject.send((stream_id, stream)).await;
+        })
+        .detach();
 
         Ok(())
     }
