@@ -1,6 +1,3 @@
-// FIXME: Remove dependency on thiserror when Futures changes to pin-project-lite
-// https://github.com/rust-lang/futures-rs/issues/2170
-
 /// Errors returned by `Multiplexer`.
 #[derive(Debug)]
 pub enum MultiplexerError {

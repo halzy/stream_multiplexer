@@ -2,7 +2,6 @@ use stream_multiplexer::*;
 
 use async_io::*;
 
-use futures_util::future::FutureExt;
 use futures_util::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use futures_util::sink::SinkExt;
 
@@ -34,8 +33,10 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = self.project();
         let mut buf = [0_u8; 1];
-        futures_util::ready!(this.inner.poll_read(cx, &mut buf))?;
-        Poll::Ready(Some(Ok(buf[0])))
+        match futures_util::ready!(this.inner.poll_read(cx, &mut buf))? {
+            0 => Poll::Ready(None),
+            _ => Poll::Ready(Some(Ok(buf[0]))),
+        }
     }
 }
 
@@ -113,12 +114,13 @@ fn create_byte_stream_pair() -> (
 
 #[test]
 fn create_and_simple_messages() {
-    smol::block_on(async move {
+    let executor = async_executor::Executor::new();
+    executor.run(async move {
         // let _ = alto_logger::init_term_logger();
 
-        let (mut left_sink_1, _left_stream, right_sink_1, right_stream_1) =
+        let (mut left_sink_1, _left_stream, _right_sink_1, right_stream_1) =
             create_byte_stream_pair();
-        let (mut left_sink_2, _left_stream, right_sink_2, right_stream_2) =
+        let (mut left_sink_2, _left_stream, _right_sink_2, right_stream_2) =
             create_byte_stream_pair();
 
         // Start the test:
@@ -126,28 +128,30 @@ fn create_and_simple_messages() {
         let first_stream_id = 1;
         let second_stream_id = 2;
 
-        let mut mp1 = Multiplexer::new();
+        let (executor, spawner) = Executor::new();
+        executor.run(2);
+        let mut mp1 = Multiplexer::new(32, spawner);
         mp1.add_stream(first_stream_id, right_stream_1).unwrap();
         mp1.add_stream(second_stream_id, right_stream_2).unwrap();
 
-        let connected: Item = mp1.recv().await.unwrap();
+        let connected: Item = mp1.recv().await;
         assert!(matches!(connected.kind, ItemKind::Connected));
         assert_eq!(first_stream_id, connected.stream_id);
 
-        let connected: Item = mp1.recv().await.unwrap();
+        let connected: Item = mp1.recv().await;
         assert!(matches!(connected.kind, ItemKind::Connected));
         assert_eq!(second_stream_id, connected.stream_id);
 
         left_sink_1.send(42).await.unwrap();
 
         // from stream_1
-        let item_1: Item = mp1.recv().await.unwrap();
+        let item_1: Item = mp1.recv().await;
         assert!(matches!(&item_1.kind, ItemKind::Value(Ok(42))));
 
         left_sink_2.send(24).await.unwrap();
 
         // from stream_2
-        let item_2: Item = mp1.recv().await.unwrap();
+        let item_2: Item = mp1.recv().await;
         assert!(matches!(item_2.kind, ItemKind::Value(Ok(24))));
 
         assert_ne!(item_1.stream_id, item_2.stream_id);
@@ -156,7 +160,8 @@ fn create_and_simple_messages() {
 
 #[test]
 fn channel_change() {
-    smol::block_on(async move {
+    let executor = async_executor::Executor::new();
+    executor.run(async move {
         let _ = alto_logger::init_term_logger();
 
         let (mut left_sink_1, _left_stream, _right_sink_1, right_stream_1) =
@@ -165,46 +170,38 @@ fn channel_change() {
         let stream_id = 7432;
 
         // Start the test:
-        let mut mp1 = Multiplexer::new();
+        let (executor, spawner) = Executor::new();
+        executor.run(2);
+        let mut mp1 = Multiplexer::new(32, spawner);
         mp1.add_stream(stream_id, right_stream_1).unwrap();
 
-        let connected: Item = mp1.recv().await.unwrap();
+        let connected: Item = mp1.recv().await;
         assert!(matches!(connected.kind, ItemKind::Connected));
         assert_eq!(stream_id, connected.stream_id);
 
         left_sink_1.send(42).await.unwrap();
 
         // from first channel
-        let item_1: Item = mp1.recv().await.unwrap();
+        let item_1: Item = mp1.recv().await;
         assert!(matches!(item_1.kind, ItemKind::Value(Ok(42))));
         assert_eq!(stream_id, item_1.stream_id);
 
-        log::error!("A:AA");
-        let recv_fuse = mp1.recv().fuse();
-        let remove_fuse = mp1.remove_stream(stream_id).fuse();
+        let stream = mp1.remove_stream(stream_id).await.unwrap();
 
-        futures_util::pin_mut!(recv_fuse);
-        futures_util::pin_mut!(remove_fuse);
-
-        let stream = futures_util::select! {
-            _nothing = recv_fuse => { panic!("Should have chosen the other branch."); },
-            stream = remove_fuse => { stream.unwrap() }
-        };
-
-        log::error!("BBB");
-
-        let mut mp2 = Multiplexer::new();
+        let (executor, spawner) = Executor::new();
+        executor.run(2);
+        let mut mp2 = Multiplexer::new(32, spawner);
         mp2.add_stream(stream_id, stream).unwrap();
 
         // Send another message and check the next channel
         left_sink_1.send(24).await.unwrap();
 
         // from second channel
-        let connected: Item = mp2.recv().await.unwrap();
+        let connected: Item = mp2.recv().await;
         assert!(matches!(connected.kind, ItemKind::Connected));
         assert_eq!(stream_id, connected.stream_id);
 
-        let item_2: Item = mp2.recv().await.unwrap();
+        let item_2: Item = mp2.recv().await;
         assert!(matches!(item_2.kind, ItemKind::Value(Ok(24))));
         assert_eq!(stream_id, item_2.stream_id);
     });
@@ -212,25 +209,28 @@ fn channel_change() {
 
 #[test]
 fn stream_drop() {
-    smol::block_on(async move {
+    let executor = async_executor::Executor::new();
+    executor.run(async move {
         // let _ = alto_logger::init_term_logger();
 
-        let (mut left_sink, left_stream, right_sink, right_stream) = create_byte_stream_pair();
+        let (mut left_sink, left_stream, _right_sink, right_stream) = create_byte_stream_pair();
 
         let stream_id = 83;
 
-        // Start the test:
-        let mut mp = Multiplexer::new();
+        // Start the test
+        let (executor, spawner) = Executor::new();
+        executor.run(2);
+        let mut mp = Multiplexer::new(32, spawner);
 
         mp.add_stream(stream_id, right_stream).unwrap();
 
-        let connected: Item = mp.recv().await.unwrap();
+        let connected: Item = mp.recv().await;
         assert!(matches!(connected.kind, ItemKind::Connected));
         assert_eq!(stream_id, connected.stream_id);
 
         // Verify that the stream is in the channel
         left_sink.send(42).await.unwrap();
-        let item_1: Item = mp.recv().await.unwrap();
+        let item_1: Item = mp.recv().await;
         assert!(matches!(item_1.kind, ItemKind::Value(Ok(42))));
         assert_eq!(stream_id, item_1.stream_id);
 
@@ -239,7 +239,7 @@ fn stream_drop() {
         drop(left_stream);
 
         // Get a None when it is removed
-        let item_2 = mp.recv().await.unwrap();
+        let item_2 = mp.recv().await;
         assert!(matches!(item_2.kind, ItemKind::Disconnected));
         assert_eq!(stream_id, item_2.stream_id);
     });
@@ -247,12 +247,16 @@ fn stream_drop() {
 
 #[test]
 fn errors() {
-    smol::block_on(async move {
+    let executor = async_executor::Executor::new();
+    executor.run(async move {
         // let _ = alto_logger::init_term_logger();
 
-        let (_left_sink, _left_stream, right_sink, right_stream) = create_byte_stream_pair();
+        let (_left_sink, _left_stream, _right_sink, _right_stream) = create_byte_stream_pair();
 
-        let mut mp = Multiplexer::<ByteStream<ReadHalf<Async<UnixStream>>>, usize>::new();
+        let (executor, spawner) = Executor::new();
+        executor.run(2);
+        let mut mp =
+            Multiplexer::<ByteStream<ReadHalf<Async<UnixStream>>>, usize>::new(32, spawner);
 
         // should fail to remove non-existent stream
         assert!(matches!(
@@ -265,7 +269,7 @@ fn errors() {
 /*
 #[test]
 fn clones() {
-    smol::run(async move {
+    async_executor::run(async move {
         let _ = alto_logger::init_term_logger();
 
         let (mut left_sink_1, mut left_stream_1, right_sink_1, right_stream_1) =

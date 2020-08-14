@@ -14,14 +14,16 @@ repository    = "https://github.com/halzy/stream_multiplexer"
 
 [dependencies]
 async-channel = "1.4.0"
+async-executor = { version = "0.1.2", default-features = false }
 atomic-waker = "1.0.0"
 futures-lite = "0.1.10"
-log = "0.4.11"
-smol = "0.3.3"
+legasea_awaken = { git = "https://git.sr.ht/~halzy/legasea_awaken" }
+legasea_eject = { git = "https://git.sr.ht/~halzy/legasea_eject" }
 
 [dev-dependencies]
-#alto_logger = "0.3.6"
-#async-io = "0.1.9"
-#futures = { version = "0.3.5", default-features = false, features=["io","std","channel"] }
-#pin-project-lite = "0.1.7"
-#smol = "0.3.3"
+alto_logger = "0.3.6"
+async-executor = { version = "0.1.2", default-features = false }
+async-io = "0.1.9"
+futures-util = { version = "0.3.5", default-features = false, features=["io","std","channel","sink","async-await-macro"] }
+log = "0.4.11"
+pin-project-lite = "0.1.7"

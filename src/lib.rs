@@ -34,7 +34,7 @@ let local_addr = listener.local_addr().unwrap();
 
 // Set up a task to add incoming connections into multiplexer
 let mut incoming_multiplexer = multiplexer.clone();
-smol::Task::spawn(async move {
+async_executor::Task::spawn(async move {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -58,7 +58,8 @@ let mut client_2 = std::net::TcpStream::connect(local_addr).unwrap();
 let mut multiplexer_ch_1 = multiplexer.clone();
 
 // Simple server that echos the data back to the stream and moves the stream to channel 2.
-smol::Task::spawn(async move {
+async_executor
+::Task::spawn(async move {
     while let Ok(stream_item) = multiplexer_ch_1.recv(CHANNEL_ONE).await {
         use ItemKind::*;
         match stream_item.kind {
@@ -87,7 +88,8 @@ smol::Task::spawn(async move {
 .detach();
 # };
 #
-# smol::block_on(fut);
+# async_executor
+::block_on(fut);
 ```
 */
 
@@ -107,14 +109,19 @@ smol::Task::spawn(async move {
 // )]
 
 mod error;
-mod notify;
+mod stream_roller;
+
 pub use error::MultiplexerError;
-use notify::*;
+use legasea_eject::*;
+use stream_roller::*;
 
 use async_channel::*;
 use futures_lite::*;
+use legasea_awaken::*;
+
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
 pub enum ItemKind<T> {
@@ -129,67 +136,40 @@ pub struct StreamItem<T, Id> {
     pub kind: ItemKind<T>,
 }
 
-struct Ejection<St, Id>
-where
-    St: 'static,
-{
-    landed_streams: HashMap<Id, St>,
-    eject_channel_tx: Sender<(Id, St)>,
-    eject_channel_rx: Receiver<(Id, St)>,
+pub struct Spawner(async_executor::Spawner);
+pub struct Executor {
+    executor: async_executor::Executor,
 }
 
-impl<St, Id> Ejection<St, Id>
-where
-    Id: Eq + std::hash::Hash + Clone,
-{
-    pub fn new() -> Self {
-        let (eject_channel_tx, eject_channel_rx) = async_channel::unbounded();
-        Self {
-            eject_channel_rx,
-            eject_channel_tx,
-            landed_streams: Default::default(),
-        }
+impl Executor {
+    pub fn new() -> (Self, Spawner) {
+        let executor = async_executor::Executor::new();
+        let spawner = Spawner(executor.spawner());
+
+        (Self { executor }, spawner)
     }
 
-    pub fn channel(&self) -> Sender<(Id, St)> {
-        self.eject_channel_tx.clone()
-    }
+    pub fn run(self, threads: usize) {
+        // FIXME: provide shutdown mechanism
+        let executor = std::sync::Arc::new(self.executor);
 
-    pub async fn recv(&mut self, stream_id: Id) -> St
-    where
-        Id: Send + Sync + Clone,
-        St: Send + Sync + Unpin + 'static,
-    {
-        if let Entry::Occupied(entry) = self.landed_streams.entry(stream_id.clone()) {
-            let (_id, stream) = entry.remove_entry();
-            return stream;
-        }
-
-        loop {
-            let (id, stream) = self
-                .eject_channel_rx
-                .recv()
-                .await
-                .expect("Should not fail, other end is owned too");
-
-            if id == stream_id {
-                return stream;
-            }
-
-            self.landed_streams
-                .insert(id, stream)
-                .expect("Should not exist, it was checked above");
+        for _ in 0..threads {
+            let executor = std::sync::Arc::clone(&executor);
+            std::thread::spawn(move || {
+                executor.run(futures_lite::future::pending::<()>());
+            });
         }
     }
 }
 
-///
+/// FIXME: multiplexing readers
 pub struct Multiplexer<St, Id>
 where
     St: Stream + 'static,
     Id: std::hash::Hash + Eq + 'static,
 {
-    stream_controls: HashMap<Id, Notifier>,
+    spawner: Arc<Spawner>,
+    stream_controls: HashMap<Id, Awaker>,
     stream_of_items_tx: Sender<StreamItem<St::Item, Id>>,
     stream_of_items_rx: Receiver<StreamItem<St::Item, Id>>,
     ejection: Ejection<St, Id>,
@@ -201,15 +181,11 @@ where
     Id: std::hash::Hash + Eq + Clone + 'static,
 {
     /// Creates a Multiplexer
-    pub fn new(buffer_size: usize) -> Self {
-        // Start the runtime so that we can create tasks later
-        smol::run(async move {
-            let _: () = future::pending().await;
-        });
-
+    pub fn new(buffer_size: usize, spawner: Arc<Spawner>) -> Self {
         let (stream_of_items_tx, stream_of_items_rx) = async_channel::bounded(buffer_size);
 
         Self {
+            spawner,
             stream_controls: Default::default(),
             stream_of_items_tx,
             stream_of_items_rx,
@@ -224,9 +200,9 @@ where
     where
         Id: Send + Sync + Clone,
         St: Send + Sync + Unpin + 'static,
-        St::Item: Send + Sync + 'static,
+        St::Item: Send + Sync + 'static + std::fmt::Debug,
     {
-        let (notifier, notify) = Notify::new();
+        let (notifier, notify) = Awaken::new();
 
         match self.stream_controls.entry(stream_id.clone()) {
             Entry::Vacant(entry) => {
@@ -242,14 +218,17 @@ where
         let mut stream_roller =
             StreamRoller::new(stream_id.clone(), stream, self.stream_of_items_tx.clone());
 
-        smol::Task::spawn(async move {
-            smol::future::race(stream_roller.roll(), notify).await;
+        self.spawner
+            .0
+            .spawn(async move {
+                futures_lite::future::race(stream_roller.roll(), notify).await;
 
-            let stream = stream_roller.into_stream();
+                let stream = stream_roller.into_stream();
 
-            return eject.send((stream_id, stream)).await.unwrap();
-        })
-        .detach();
+                // If the send fails, multiplexer is shutting down
+                return eject.send((stream_id, stream)).await;
+            })
+            .detach();
 
         Ok(())
     }
@@ -270,7 +249,7 @@ where
             .remove(&stream_id)
             .ok_or_else(|| MultiplexerError::UnknownStream)?;
 
-        control.notify();
+        control.wake();
 
         Ok(self.ejection.recv(stream_id).await)
     }
@@ -289,58 +268,5 @@ where
             .recv()
             .await
             .expect("The other end of the channel we hold should not drop.")
-    }
-}
-
-struct StreamRoller<St, Id>
-where
-    St: Stream,
-{
-    stream_id: Id,
-    stream: St,
-    stream_of_items: Sender<StreamItem<St::Item, Id>>,
-}
-
-impl<St, Id> StreamRoller<St, Id>
-where
-    Id: Send + Sync + Clone,
-    St: Send + Sync + Stream + Unpin,
-    St::Item: Send + Sync,
-{
-    fn new(stream_id: Id, stream: St, stream_of_items: Sender<StreamItem<St::Item, Id>>) -> Self {
-        Self {
-            stream_id,
-            stream,
-            stream_of_items,
-        }
-    }
-
-    fn into_stream(self) -> St {
-        self.stream
-    }
-
-    pub async fn roll(&mut self) {
-        self.stream_of_items
-            .send(StreamItem {
-                stream_id: self.stream_id.clone(),
-                kind: ItemKind::Connected,
-            })
-            .await
-            .unwrap();
-        loop {
-            // FIXME: stop looping with disconnect
-            let kind = match self.stream.next().await {
-                Some(item) => ItemKind::Value(item),
-                None => ItemKind::Disconnected,
-            };
-
-            self.stream_of_items
-                .send(StreamItem {
-                    stream_id: self.stream_id.clone(),
-                    kind,
-                })
-                .await
-                .unwrap();
-        }
     }
 }
