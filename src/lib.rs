@@ -121,7 +121,12 @@ use legasea_awaken::*;
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::sync::Arc;
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum EjectKind {
+    Take,
+    Forget,
+}
 
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
 pub enum ItemKind<T> {
@@ -137,21 +142,19 @@ pub struct StreamItem<T, Id> {
 }
 
 /// FIXME: multiplexing readers
-pub struct Multiplexer<St, Id>
+pub struct Multiplexer<St, Item, Id>
 where
-    St: Stream + 'static,
-    Id: std::hash::Hash + Eq + 'static,
+    St: 'static,
 {
-    stream_controls: HashMap<Id, Awaker>,
-    stream_of_items_tx: Sender<StreamItem<St::Item, Id>>,
-    stream_of_items_rx: Receiver<StreamItem<St::Item, Id>>,
+    stream_controls: HashMap<Id, Awaker<EjectKind>>,
+    stream_of_items_tx: Sender<StreamItem<Item, Id>>,
+    stream_of_items_rx: Receiver<StreamItem<Item, Id>>,
     ejection: Ejection<St, Id>,
 }
 
-impl<St, Id> Multiplexer<St, Id>
+impl<St, Item, Id> Multiplexer<St, Item, Id>
 where
-    St: Stream,
-    Id: std::hash::Hash + Eq + Clone + 'static,
+    Id: Eq + std::hash::Hash + Clone,
 {
     /// Creates a Multiplexer
     pub fn new(buffer_size: usize) -> Self {
@@ -165,14 +168,51 @@ where
         }
     }
 
+    pub fn remove(&mut self, stream_id: Id) -> Result<(), MultiplexerError> {
+        // If the stream is changing channels, it may not have a control and will be dropped in process_add_channel
+        let control = self
+            .stream_controls
+            .remove(&stream_id)
+            .ok_or_else(|| MultiplexerError::UnknownStream)?;
+
+        control.wake(EjectKind::Forget);
+
+        Ok(())
+    }
+
+    /// Removes the stream from the multiplexer.
+    ///
+    /// Will only be able to return stream if `recv()` is being polled.
+    pub async fn take(&mut self, stream_id: Id) -> Result<St, MultiplexerError>
+    where
+        Id: std::fmt::Debug,
+        Id: Send + Sync + Clone,
+        St: Send + Sync + Stream + Unpin,
+        St::Item: Send + Sync,
+    {
+        // If the stream is changing channels, it may not have a control and will be dropped in process_add_channel
+        let control = self
+            .stream_controls
+            .remove(&stream_id)
+            .ok_or_else(|| MultiplexerError::UnknownStream)?;
+
+        control.wake(EjectKind::Take);
+
+        Ok(self.ejection.recv(stream_id).await)
+    }
+}
+
+impl<St, Item, Id> Multiplexer<St, Item, Id> {
     /// Adds `stream` with the given `stream_id`.
     ///
     /// Returns an error if the `stream_id` already exists.
     pub fn add_stream(&mut self, stream_id: Id, stream: St) -> Result<(), MultiplexerError>
     where
-        Id: Send + Sync + Clone,
+        Id: Eq + std::hash::Hash + Clone,
+        Id: Send + Sync + Unpin + 'static,
+        St: Stream<Item = Item>,
         St: Send + Sync + Unpin + 'static,
-        St::Item: Send + Sync + 'static + std::fmt::Debug,
+        St::Item: Send + Sync + Unpin + 'static,
     {
         let (notifier, notify) = Awaken::new();
 
@@ -191,48 +231,39 @@ where
             StreamRoller::new(stream_id.clone(), stream, self.stream_of_items_tx.clone());
 
         async_executor::Task::spawn(async move {
-            futures_lite::future::race(stream_roller.roll(), notify).await;
+            let eject_kind = futures_lite::future::race(
+                async {
+                    stream_roller.roll().await;
+                    // If the client is dropped, we're forgetting them
+                    EjectKind::Forget
+                },
+                notify,
+            )
+            .await;
 
-            let stream = stream_roller.into_stream();
+            if eject_kind == EjectKind::Take {
+                let stream = stream_roller.into_stream();
 
-            // If the send fails, multiplexer is shutting down
-            return eject.send((stream_id, stream)).await;
+                // If the send fails, multiplexer is shutting down
+                eject.send((stream_id, stream)).await
+            } else {
+                Ok(())
+            }
         })
         .detach();
 
         Ok(())
     }
+}
 
-    /// Removes the stream from the multiplexer.
-    ///
-    /// Will only be able to return stream if `recv()` is being polled.
-    pub async fn remove_stream(&mut self, stream_id: Id) -> Result<St, MultiplexerError>
-    where
-        Id: std::fmt::Debug,
-        Id: Send + Sync + Clone,
-        St: Send + Sync + Stream + Unpin,
-        St::Item: Send + Sync,
-    {
-        // If the stream is changing channels, it may not have a control and will be dropped in process_add_channel
-        let control = self
-            .stream_controls
-            .remove(&stream_id)
-            .ok_or_else(|| MultiplexerError::UnknownStream)?;
-
-        control.wake();
-
-        Ok(self.ejection.recv(stream_id).await)
-    }
-
+impl<St, Item, Id> Multiplexer<St, Item, Id> {
     /// Receives the next packet available from a channel:
     ///
     /// Returns a `StreamItem` or `MultiplexerError::UnknownChannel` if called with an unknown
     /// `channel_id`.
     pub async fn recv(&mut self) -> StreamItem<St::Item, Id>
     where
-        Id: Send + Sync + Clone,
-        St: Send + Sync + Stream + Unpin,
-        St::Item: Send + Sync,
+        St: Stream<Item = Item>,
     {
         self.stream_of_items_rx
             .recv()

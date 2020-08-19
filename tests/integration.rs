@@ -132,10 +132,12 @@ fn create_and_simple_messages() {
         mp1.add_stream(first_stream_id, right_stream_1).unwrap();
         mp1.add_stream(second_stream_id, right_stream_2).unwrap();
 
+        // stream 1 connects
         let connected: Item = mp1.recv().await;
         assert!(matches!(connected.kind, ItemKind::Connected));
         assert_eq!(first_stream_id, connected.stream_id);
 
+        // stream 2 connects
         let connected: Item = mp1.recv().await;
         assert!(matches!(connected.kind, ItemKind::Connected));
         assert_eq!(second_stream_id, connected.stream_id);
@@ -182,7 +184,7 @@ fn channel_change() {
         assert!(matches!(item_1.kind, ItemKind::Value(Ok(42))));
         assert_eq!(stream_id, item_1.stream_id);
 
-        let stream = mp1.remove_stream(stream_id).await.unwrap();
+        let stream = mp1.take(stream_id).await.unwrap();
 
         let mut mp2 = Multiplexer::new(32);
         mp2.add_stream(stream_id, stream).unwrap();
@@ -245,97 +247,12 @@ fn errors() {
 
         let (_left_sink, _left_stream, _right_sink, _right_stream) = create_byte_stream_pair();
 
-        let mut mp = Multiplexer::<ByteStream<ReadHalf<Async<UnixStream>>>, usize>::new(32);
+        let mut mp = Multiplexer::<ByteStream<ReadHalf<Async<UnixStream>>>, u8, usize>::new(32);
 
         // should fail to remove non-existent stream
         assert!(matches!(
-            mp.remove_stream(0_usize).await,
+            mp.take(0_usize).await,
             Err(MultiplexerError::UnknownStream)
         ));
     });
 }
-
-/*
-#[test]
-fn clones() {
-    async_executor::run(async move {
-        let _ = alto_logger::init_term_logger();
-
-        let (mut left_sink_1, mut left_stream_1, right_sink_1, right_stream_1) =
-            create_byte_stream_pair();
-
-        let (mut left_sink_2, mut left_stream_2, right_sink_2, right_stream_2) =
-            create_byte_stream_pair();
-
-        // Start the test:
-        let channel_id = 3;
-
-        let mut mp = Multiplexer::new();
-        mp.add_channel(channel_id).unwrap();
-
-        let stream_id_1 = mp
-            .add_stream(right_sink_1, right_stream_1, channel_id)
-            .unwrap();
-
-        let stream_id_2 = mp
-            .add_stream(right_sink_2, right_stream_2, channel_id)
-            .unwrap();
-
-        let connected = mp.recv().await.unwrap();
-        assert!(matches!(connected.kind, ItemKind::Connected));
-        assert_eq!(stream_id_1, connected.stream_id);
-
-        let connected = mp.recv().await.unwrap();
-        assert!(matches!(connected.kind, ItemKind::Connected));
-        assert_eq!(stream_id_2, connected.stream_id);
-
-        smol::Task::spawn(async move {
-            loop {
-                left_sink_1
-                    .send(left_stream_1.next().await.unwrap().unwrap())
-                    .await
-                    .unwrap();
-            }
-        })
-        .detach();
-
-        smol::Task::spawn(async move {
-            loop {
-                left_sink_2
-                    .send(left_stream_2.next().await.unwrap().unwrap())
-                    .await
-                    .unwrap();
-            }
-        })
-        .detach();
-
-        let mp1: Multiplexer<_, _, _> = mp.clone();
-        smol::Task::spawn(async move {
-            mp1.send(Some(stream_id_1), Some(33_u8))
-                .for_each(|_| async move { () })
-                .await;
-        })
-        .detach();
-
-        let mp2 = mp.clone();
-        smol::Task::spawn(async move {
-            mp2.send(Some(stream_id_2), Some(22_u8))
-                .for_each(|_| async move { () })
-                .await;
-        })
-        .detach();
-
-        let res1 = mp.recv().await.unwrap();
-        let res2 = mp.recv().await.unwrap();
-
-        if res1.stream_id == stream_id_1 {
-            assert!(matches!(res1.kind, ItemKind::Value(Ok(33))));
-            assert!(matches!(res2.kind, ItemKind::Value(Ok(22))));
-        } else {
-            assert_eq!(res2.stream_id, stream_id_2);
-            assert!(matches!(res1.kind, ItemKind::Value(Ok(22))));
-            assert!(matches!(res2.kind, ItemKind::Value(Ok(33))));
-        }
-    });
-}
-*/

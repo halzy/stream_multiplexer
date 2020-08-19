@@ -17,7 +17,8 @@ async-channel = "1.4.0"
 async-executor = { version = "0.1.2", default-features = false }
 atomic-waker = "1.0.0"
 futures-lite = "0.1.10"
-legasea_awaken = { git = "https://git.sr.ht/~halzy/legasea_awaken" }
+# legasea_awaken = { git = "https://git.sr.ht/~halzy/legasea_awaken" }
+legasea_awaken = { path="../legasea_awaken" }
 legasea_eject = { git = "https://git.sr.ht/~halzy/legasea_eject" }
 
 [dev-dependencies]
