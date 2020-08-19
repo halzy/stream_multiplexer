@@ -186,8 +186,7 @@ impl<St, Item, Id> Multiplexer<St, Item, Id> {
     pub async fn take(&mut self, stream_id: Id) -> Result<St, MultiplexerError>
     where
         Id: Eq + std::hash::Hash + Clone,
-        St: Send + Sync + Stream + Unpin,
-        St::Item: Send + Sync,
+        St: Send + Sync + Unpin,
     {
         // If the stream is changing channels, it may not have a control and will be dropped in process_add_channel
         let control = self
