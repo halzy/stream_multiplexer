@@ -152,10 +152,7 @@ where
     ejection: Ejection<St, Id>,
 }
 
-impl<St, Item, Id> Multiplexer<St, Item, Id>
-where
-    Id: Eq + std::hash::Hash + Clone,
-{
+impl<St, Item, Id> Multiplexer<St, Item, Id> {
     /// Creates a Multiplexer
     pub fn new(buffer_size: usize) -> Self {
         let (stream_of_items_tx, stream_of_items_rx) = async_channel::bounded(buffer_size);
@@ -168,7 +165,10 @@ where
         }
     }
 
-    pub fn remove(&mut self, stream_id: Id) -> Result<(), MultiplexerError> {
+    pub fn remove(&mut self, stream_id: Id) -> Result<(), MultiplexerError>
+    where
+        Id: Eq + std::hash::Hash,
+    {
         // If the stream is changing channels, it may not have a control and will be dropped in process_add_channel
         let control = self
             .stream_controls
@@ -185,8 +185,7 @@ where
     /// Will only be able to return stream if `recv()` is being polled.
     pub async fn take(&mut self, stream_id: Id) -> Result<St, MultiplexerError>
     where
-        Id: std::fmt::Debug,
-        Id: Send + Sync + Clone,
+        Id: Eq + std::hash::Hash + Clone,
         St: Send + Sync + Stream + Unpin,
         St::Item: Send + Sync,
     {
@@ -225,7 +224,7 @@ impl<St, Item, Id> Multiplexer<St, Item, Id> {
             }
         }
 
-        let eject = self.ejection.channel();
+        let eject = self.ejection.channel().clone();
 
         let mut stream_roller =
             StreamRoller::new(stream_id.clone(), stream, self.stream_of_items_tx.clone());
