@@ -121,6 +121,7 @@ use legasea_awaken::*;
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 enum EjectKind {
@@ -146,7 +147,8 @@ pub struct Multiplexer<St, Item, Id>
 where
     St: 'static,
 {
-    stream_controls: HashMap<Id, Awaker<EjectKind>>,
+    // FIXME: Investigate contention / alternatives to the mutex lock
+    stream_controls: Arc<Mutex<HashMap<Id, Awaker<EjectKind>>>>,
     stream_of_items_tx: Sender<StreamItem<Item, Id>>,
     stream_of_items_rx: Receiver<StreamItem<Item, Id>>,
     ejection: Ejection<St, Id>,
@@ -172,6 +174,8 @@ impl<St, Item, Id> Multiplexer<St, Item, Id> {
         // If the stream is changing channels, it may not have a control and will be dropped in process_add_channel
         let control = self
             .stream_controls
+            .lock()
+            .unwrap()
             .remove(&stream_id)
             .ok_or_else(|| MultiplexerError::UnknownStream)?;
 
@@ -191,6 +195,8 @@ impl<St, Item, Id> Multiplexer<St, Item, Id> {
         // If the stream is changing channels, it may not have a control and will be dropped in process_add_channel
         let control = self
             .stream_controls
+            .lock()
+            .unwrap()
             .remove(&stream_id)
             .ok_or_else(|| MultiplexerError::UnknownStream)?;
 
@@ -214,7 +220,12 @@ impl<St, Item, Id> Multiplexer<St, Item, Id> {
     {
         let (notifier, notify) = Awaken::new();
 
-        match self.stream_controls.entry(stream_id.clone()) {
+        match self
+            .stream_controls
+            .lock()
+            .unwrap()
+            .entry(stream_id.clone())
+        {
             Entry::Vacant(entry) => {
                 entry.insert(notifier);
             }
@@ -227,6 +238,8 @@ impl<St, Item, Id> Multiplexer<St, Item, Id> {
 
         let mut stream_roller =
             StreamRoller::new(stream_id.clone(), stream, self.stream_of_items_tx.clone());
+
+        let stream_controls = Arc::clone(&self.stream_controls);
 
         async_executor::Task::spawn(async move {
             let eject_kind = futures_lite::future::race(
@@ -245,6 +258,7 @@ impl<St, Item, Id> Multiplexer<St, Item, Id> {
                 // If the send fails, multiplexer is shutting down
                 eject.send((stream_id, stream)).await
             } else {
+                stream_controls.lock().unwrap().remove(&stream_id);
                 Ok(())
             }
         })
