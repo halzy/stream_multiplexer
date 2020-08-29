@@ -112,12 +112,13 @@ mod error;
 mod stream_roller;
 
 pub use error::MultiplexerError;
-use legasea_eject::*;
-use stream_roller::*;
+use legasea_eject::Ejection;
+use stream_roller::StreamRoller;
 
-use async_channel::*;
-use futures_lite::*;
-use legasea_awaken::*;
+use async_channel::{self as channel, Receiver, Sender};
+use async_executor::Executor;
+use futures_lite::{future, Stream};
+use legasea_awaken::{Awaken, Awaker};
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -147,6 +148,7 @@ pub struct Multiplexer<St, Item, Id>
 where
     St: 'static,
 {
+    executor: Arc<Executor>,
     // FIXME: Investigate contention / alternatives to the mutex lock
     stream_controls: Arc<Mutex<HashMap<Id, Awaker<EjectKind>>>>,
     stream_of_items_tx: Sender<StreamItem<Item, Id>>,
@@ -156,10 +158,11 @@ where
 
 impl<St, Item, Id> Multiplexer<St, Item, Id> {
     /// Creates a Multiplexer
-    pub fn new(buffer_size: usize) -> Self {
-        let (stream_of_items_tx, stream_of_items_rx) = async_channel::bounded(buffer_size);
+    pub fn new(executor: Arc<Executor>, buffer_size: usize) -> Self {
+        let (stream_of_items_tx, stream_of_items_rx) = channel::bounded(buffer_size);
 
         Self {
+            executor,
             stream_controls: Default::default(),
             stream_of_items_tx,
             stream_of_items_rx,
@@ -241,28 +244,29 @@ impl<St, Item, Id> Multiplexer<St, Item, Id> {
 
         let stream_controls = Arc::clone(&self.stream_controls);
 
-        async_executor::Task::spawn(async move {
-            let eject_kind = futures_lite::future::race(
-                async {
-                    stream_roller.roll().await;
-                    // If the client is dropped, we're forgetting them
-                    EjectKind::Forget
-                },
-                notify,
-            )
-            .await;
+        self.executor
+            .spawn(async move {
+                let eject_kind = future::race(
+                    async {
+                        stream_roller.roll().await;
+                        // If the client is dropped, we're forgetting them
+                        EjectKind::Forget
+                    },
+                    notify,
+                )
+                .await;
 
-            if eject_kind == EjectKind::Take {
-                let stream = stream_roller.into_stream();
+                if eject_kind == EjectKind::Take {
+                    let stream = stream_roller.into_stream();
 
-                // If the send fails, multiplexer is shutting down
-                eject.send((stream_id, stream)).await
-            } else {
-                stream_controls.lock().unwrap().remove(&stream_id);
-                Ok(())
-            }
-        })
-        .detach();
+                    // If the send fails, multiplexer is shutting down
+                    eject.send((stream_id, stream)).await
+                } else {
+                    stream_controls.lock().unwrap().remove(&stream_id);
+                    Ok(())
+                }
+            })
+            .detach();
 
         Ok(())
     }
